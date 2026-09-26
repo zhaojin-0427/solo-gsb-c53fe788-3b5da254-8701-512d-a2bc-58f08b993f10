@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: consent
+      POSTGRES_PASSWORD: consent
+      POSTGRES_DB: consent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U consent -d consent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://consent:consent@db:5432/consent
+      # 撤销处置台账令牌（本地开发默认值，生产部署务必覆盖）：
+      #   管理员令牌 -> 复核；接收方令牌 -> 只能查询 / 提交自己的处置项。
+      REMEDIATION_ADMIN_TOKEN: dev-admin-token
+      REMEDIATION_RECIPIENT_TOKENS: partner-a=dev-token-a,partner-b=dev-token-b
+      # 合规证明 HMAC-SHA256 签名密钥（本地开发默认值，生产部署务必覆盖；
+      # 验签只依赖声明字节、摘要、签名与此密钥，不读取业务状态）。
+      ATTESTATION_HMAC_KEY: dev-attestation-hmac-key
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
