@@ -337,5 +337,40 @@ class RemediationStatusTests(unittest.TestCase):
         self.assertEqual(cs([]), "closed")
 
 
+class ClassifyChangeTests(unittest.TestCase):
+    """双时点差异分类：added / removed / changed / unchanged。"""
+
+    def test_added_only_on_to_side(self):
+        from app.domain import classify_change
+        self.assertEqual(
+            classify_change(False, True, None, ("active", ())), "added")
+
+    def test_removed_only_on_from_side(self):
+        from app.domain import classify_change
+        # 本系统只追加，removed 实际不出现；分类保持完备。
+        self.assertEqual(
+            classify_change(True, False, ("active", ()), None), "removed")
+
+    def test_changed_when_state_keys_differ(self):
+        from app.domain import classify_change
+        self.assertEqual(
+            classify_change(True, True, ("active", ()), ("blocked", (7,))),
+            "changed")
+        self.assertEqual(
+            classify_change(True, True, (True, (), 2), (True, (), 3)),
+            "changed")
+
+    def test_unchanged_when_state_keys_equal(self):
+        from app.domain import classify_change
+        self.assertEqual(
+            classify_change(True, True, ("blocked", (7,)), ("blocked", (7,))),
+            "unchanged")
+
+    def test_absent_on_both_sides_is_rejected(self):
+        from app.domain import classify_change
+        with self.assertRaises(ValueError):
+            classify_change(False, False, None, None)
+
+
 if __name__ == "__main__":
     unittest.main()

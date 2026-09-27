@@ -102,6 +102,9 @@ class InMemoryRepo:
             rows = [e for e in rows if e["seq"] <= as_of_seq]
         return sorted(rows, key=lambda e: e["seq"])
 
+    def max_event_seq(self):
+        return max([e["seq"] for e in self.bag["events"]] + [0])
+
     def get_receipt(self, key):
         return self.bag["receipts"].get(key)
 
@@ -348,6 +351,12 @@ def deletion_req(subject, product_ids, requested_at=None):
     return SimpleNamespace(
         subject_id=subject, product_ids=product_ids,
         requested_at=requested_at or dt("2026-09-26T08:00:00Z"))
+
+
+def diff_req(subject, product_ids, from_seq, to_seq,
+             use_at=dt("2026-05-01T00:00:00Z")):
+    return SimpleNamespace(subject_id=subject, product_ids=product_ids,
+                           use_at=use_at, from_seq=from_seq, to_seq=to_seq)
 
 
 class ServiceSmokeTests(unittest.TestCase):
@@ -901,6 +910,231 @@ class ServiceSmokeTests(unittest.TestCase):
                   for o in r2["remediation_items"]}
         self.assertEqual(opened["t1"], ["p1", "p2"])
         self.assertEqual(opened["t2"], ["p2"])
+
+    # ------------------------------------------------------- 合规差异报告
+    def _build_diff_scenario(self, s):
+        """许可 -> 任务/产物 -> 追溯撤销 -> 新许可恢复 -> 新任务/产物。
+
+        事件序号：g1=1，撤销=2，g2=3；p1/p2 recorded_seq=1，p3 recorded_seq=3。
+        """
+        svc, _ = make_service()
+        svc.append_grant(grant_req(s, "g1"))
+        svc.register_task("t1", task_req(s, [
+            product("p1", [[("receipt", "t1")]]),
+            product("p2", [[("product", "p1")]])]))
+        rev = svc.append_revocation(
+            revoke_req(s, "g1", dt("2026-01-15T00:00:00Z")))
+        svc.append_grant(grant_req(s, "g2"))
+        svc.register_task("t2", task_req(s, [
+            product("p3", [[("receipt", "t2")]])]))
+        return svc, rev["event"]["seq"]
+
+    def test_compliance_diff_two_bound_replay(self):
+        svc, rev_seq = self._build_diff_scenario("user-diff")
+        s = "user-diff"
+
+        # ---- diff(1, 2)：撤销落入区间 -> 回执 / 产物翻转、处置开立、删除结论翻转。
+        # 在全部事件（含 seq=3 的恢复许可）之后签发：取消记录 grant_seq=3 对
+        # to=2 一侧不可见（后续事件不改变报告）。
+        d = svc.compliance_diff(diff_req(s, ["p1", "p2"], 1, 2))
+        self.assertEqual(d["from_seq"], 1)
+        self.assertEqual(d["to_seq"], 2)
+        self.assertEqual(d["from_basis_seq"], 1)
+        self.assertEqual(d["to_basis_seq"], 2)
+        self.assertEqual([p["product_id"] for p in d["products"]],
+                         ["p1", "p2"])  # 按产品 ID 稳定排序
+        p1 = d["products"][0]
+        self.assertEqual(p1["classification"], "changed")
+        self.assertEqual(p1["from"]["status"], "active")
+        self.assertEqual(p1["to"]["status"], "blocked")
+        self.assertEqual(p1["to"]["invalidating_events"], [rev_seq])
+        flip = p1["flip_reasons"][0]
+        self.assertEqual(flip["kind"], "status_flip")
+        self.assertEqual(flip["causing_receipts"], ["t1"])
+        # 传递回执：valid -> invalid，翻转原因定位到撤销事件。
+        r1 = p1["receipts"][0]
+        self.assertEqual(r1["receipt_key"], "t1")
+        self.assertEqual(r1["classification"], "changed")
+        self.assertEqual(r1["decision"], "allow")
+        self.assertEqual(r1["basis"]["grant_id"], "g1")
+        self.assertTrue(r1["from"]["currently_valid"])
+        self.assertFalse(r1["to"]["currently_valid"])
+        self.assertEqual(r1["to"]["invalidating_events"], [rev_seq])
+        self.assertEqual(r1["flip_reasons"][0]["kind"], "revoked")
+        self.assertEqual(r1["flip_reasons"][0]["revocation_seq"], rev_seq)
+        self.assertEqual(r1["flip_reasons"][0]["grant_id"], "g1")
+        # 处置项：added（开立于 seq=2）；取消（grant_seq=3）对该侧不可见。
+        self.assertEqual(len(d["remediation_items"]), 1)
+        item = d["remediation_items"][0]
+        self.assertEqual(item["classification"], "added")
+        self.assertEqual(item["from"], {"presence": "absent"})
+        self.assertEqual(item["to"]["status"], "open")
+        self.assertEqual(item["flip_reasons"],
+                         [{"kind": "opened", "revocation_seq": rev_seq}])
+        # 删除结论：active_grant(g1) -> open_remediation。
+        self.assertEqual(d["deletion"]["classification"], "changed")
+        self.assertEqual(d["deletion"]["from"]["status"], "blocked")
+        self.assertEqual([b["kind"] for b in d["deletion"]["from"]["blockers"]],
+                         ["active_grant"])
+        self.assertEqual([b["kind"] for b in d["deletion"]["to"]["blockers"]],
+                         ["open_remediation"])
+        kinds = [r["kind"] for r in d["deletion"]["flip_reasons"]]
+        self.assertIn("blocker_removed", kinds)
+        self.assertIn("blocker_added", kinds)
+        # 汇总计数。
+        self.assertEqual(d["summary"]["products"],
+                         {"added": 0, "removed": 0, "changed": 2,
+                          "unchanged": 0})
+        self.assertEqual(d["summary"]["remediation_items"]["added"], 1)
+        self.assertEqual(d["summary"]["deletion"], "changed")
+
+        # ---- diff(2, 3)：恢复许可落入区间 -> 回执恢复、处置取消、结论回摆。
+        d2 = svc.compliance_diff(diff_req(s, ["p1"], 2, 3))
+        p1 = d2["products"][0]
+        self.assertEqual(p1["classification"], "changed")
+        self.assertEqual(p1["from"]["status"], "blocked")
+        self.assertEqual(p1["to"]["status"], "active")
+        r1 = p1["receipts"][0]
+        self.assertEqual(r1["classification"], "changed")
+        self.assertFalse(r1["from"]["currently_valid"])
+        self.assertTrue(r1["to"]["currently_valid"])
+        self.assertEqual(r1["flip_reasons"],
+                         [{"kind": "hit_grant_changed",
+                           "from_grant": {"grant_id": "g1", "grant_seq": 1},
+                           "to_grant": {"grant_id": "g2", "grant_seq": 3}}])
+        item = d2["remediation_items"][0]
+        self.assertEqual(item["classification"], "changed")
+        self.assertEqual(item["from"]["status"], "open")
+        self.assertEqual(item["to"]["status"], "cancelled")
+        self.assertEqual(item["flip_reasons"],
+                         [{"kind": "cancelled", "grant_seq": 3}])
+        self.assertEqual([b["kind"] for b in d2["deletion"]["to"]["blockers"]],
+                         ["active_grant"])
+        self.assertEqual(
+            d2["deletion"]["to"]["blockers"][0]["grant_id"], "g2")
+
+        # ---- diff(1, 3)：p3 在 from 侧尚未登记 -> absent / added；
+        #    p1 两侧均 active（unchanged），但其回执命中许可变化（changed）。
+        d3 = svc.compliance_diff(diff_req(s, ["p1", "p3"], 1, 3))
+        by_pid = {p["product_id"]: p for p in d3["products"]}
+        self.assertEqual(by_pid["p1"]["classification"], "unchanged")
+        self.assertEqual(by_pid["p1"]["receipts"][0]["classification"],
+                         "changed")
+        # 两侧均有效、命中许可被更新许可取代：仅 hit_grant_changed 原因。
+        self.assertEqual(
+            by_pid["p1"]["receipts"][0]["flip_reasons"],
+            [{"kind": "hit_grant_changed",
+              "from_grant": {"grant_id": "g1", "grant_seq": 1},
+              "to_grant": {"grant_id": "g2", "grant_seq": 3}}])
+        p3 = by_pid["p3"]
+        self.assertEqual(p3["classification"], "added")
+        self.assertEqual(p3["from"], {"presence": "absent"})
+        self.assertEqual(p3["to"]["status"], "active")
+        self.assertEqual(p3["flip_reasons"][0]["kind"], "registered")
+        self.assertEqual(p3["receipts"][0]["classification"], "added")
+        self.assertEqual(p3["receipts"][0]["from"], {"presence": "absent"})
+        # 删除结论：两侧均 blocked，但命中许可身份 g1 -> g2 变化。
+        self.assertEqual(d3["deletion"]["classification"], "changed")
+        self.assertEqual(d3["deletion"]["from"]["status"], "blocked")
+        self.assertEqual(d3["deletion"]["to"]["status"], "blocked")
+        self.assertEqual(d3["summary"]["products"]["added"], 1)
+        self.assertEqual(d3["summary"]["products"]["unchanged"], 1)
+
+        # ---- 后续事件不改变报告：追加新许可 / 撤销后重发同一 diff 完全一致。
+        before = svc.compliance_diff(diff_req(s, ["p1", "p2"], 1, 2))
+        svc.append_grant(grant_req(s, "g3"))
+        svc.append_revocation(revoke_req(s, "g2", dt("2026-02-01T00:00:00Z")))
+        after = svc.compliance_diff(diff_req(s, ["p1", "p2"], 1, 2))
+        self.assertEqual(before, after)
+
+    def test_compliance_diff_rerevocation_and_deny_receipt(self):
+        """invalid -> invalid（换许可再被撤销）与登记即拒绝回执的差异口径。"""
+        svc, _ = make_service()
+        s = "user-diff3"
+        svc.append_grant(grant_req(s, "g1"))                    # seq=1
+        svc.register_task("t1", task_req(s, [
+            product("p1", [[("receipt", "t1")]])]))
+        svc.append_revocation(revoke_req(s, "g1", dt("2026-01-15T00:00:00Z")))
+        svc.append_grant(grant_req(s, "g2"))                    # seq=3
+        rev2 = svc.append_revocation(
+            revoke_req(s, "g2", dt("2026-02-01T00:00:00Z")))    # seq=4
+        # 撤销后登记：回执为 deny（永久无效，失效事件集合为空）。
+        svc.register_task("t2", task_req(s, [
+            product("p2", [[("receipt", "t2")]])]))
+
+        # diff(2, 4)：t1 两侧均失效，但失效事件与命中许可都变化。
+        d = svc.compliance_diff(diff_req(s, ["p1"], 2, 4))
+        rec = d["products"][0]["receipts"][0]
+        self.assertEqual(rec["classification"], "changed")
+        self.assertEqual(rec["from"]["invalidating_events"], [2])
+        self.assertEqual(rec["to"]["invalidating_events"],
+                         [rev2["event"]["seq"]])
+        self.assertEqual(
+            [r["kind"] for r in rec["flip_reasons"]],
+            ["revoked", "hit_grant_changed"])
+        # 产品两侧均 blocked 但失效事件集合变化 -> changed。
+        p1 = d["products"][0]
+        self.assertEqual(p1["classification"], "changed")
+        self.assertEqual(p1["flip_reasons"][0]["kind"],
+                         "invalidating_events_changed")
+
+        # diff(1, 4)：deny 回执 t2 在 from 侧不存在 -> added；两侧恒无效。
+        d = svc.compliance_diff(diff_req(s, ["p2"], 1, 4))
+        rec = d["products"][0]["receipts"][0]
+        self.assertEqual(rec["classification"], "added")
+        self.assertEqual(rec["decision"], "deny")
+        self.assertEqual(rec["to"]["currently_valid"], False)
+        self.assertEqual(rec["to"]["invalidating_events"], [])
+        self.assertIsNone(rec["to"]["hit_grant"])
+        # diff(4, 4+?) 不可行（需 from<to），改测 deny 回执两侧一致：
+        svc.append_grant(grant_req(s, "g3"))                    # seq=5
+        d = svc.compliance_diff(diff_req(s, ["p2"], 4, 5))
+        rec = d["products"][0]["receipts"][0]
+        self.assertEqual(rec["classification"], "unchanged")
+        self.assertEqual(d["products"][0]["classification"], "unchanged")
+
+    def test_compliance_diff_validation_and_unchanged(self):
+        from app.errors import ApiError
+        svc, _ = make_service()
+        s = "user-diff2"
+        svc.append_grant(grant_req(s, "g1"))
+        svc.register_task("t1", task_req(s, [
+            product("p1", [[("receipt", "t1")]])]))
+
+        # from_seq >= to_seq -> 422；未来序号 -> 422；未知产品 -> 422。
+        with self.assertRaises(ApiError) as cm:
+            svc.compliance_diff(diff_req(s, ["p1"], 1, 1))
+        self.assertEqual(cm.exception.status_code, 422)
+        with self.assertRaises(ApiError) as cm:
+            svc.compliance_diff(diff_req(s, ["p1"], 1, 999))
+        self.assertEqual(cm.exception.status_code, 422)
+        with self.assertRaises(ApiError) as cm:
+            svc.compliance_diff(diff_req(s, ["ghost"], 1, 1 + 1))
+        self.assertEqual(cm.exception.status_code, 422)
+
+        # 追加一条与回执四元组无关的许可（seq=2）：diff(1, 2) 全部 unchanged。
+        svc.append_grant(SimpleNamespace(
+            subject_id=s, grant_id="g9", category="location",
+            purpose="marketing", recipient="partner-b",
+            valid_from=dt("2026-01-01T00:00:00Z"), valid_to=None))
+        d = svc.compliance_diff(diff_req(s, ["p1"], 1, 2))
+        self.assertEqual(d["products"][0]["classification"], "unchanged")
+        self.assertEqual(d["products"][0]["receipts"][0]["classification"],
+                         "unchanged")
+        self.assertEqual(d["remediation_items"], [])
+        self.assertEqual(d["deletion"]["classification"], "unchanged")
+        self.assertEqual(d["deletion"]["flip_reasons"], [])
+
+        # 晚于 to_seq 登记的产品：两侧快照均不存在 -> 422。
+        svc.append_grant(grant_req(s, "g3"))  # seq=3
+        svc.register_task("t2", task_req(s, [
+            product("p2", [[("receipt", "t2")]])]))  # recorded_seq=3
+        with self.assertRaises(ApiError) as cm:
+            svc.compliance_diff(diff_req(s, ["p2"], 1, 2))
+        self.assertEqual(cm.exception.status_code, 422)
+        # to_seq 覆盖其登记序号后允许（from 侧 absent -> added）。
+        d = svc.compliance_diff(diff_req(s, ["p2"], 1, 3))
+        self.assertEqual(d["products"][0]["classification"], "added")
 
 
 if __name__ == "__main__":

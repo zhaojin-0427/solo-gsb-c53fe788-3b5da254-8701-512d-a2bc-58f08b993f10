@@ -394,6 +394,32 @@ def deletion_conclusion(status: str, blockers: Iterable[dict]) -> tuple:
             tuple(sorted(deletion_blocker_identity(b) for b in blockers)))
 
 
+# ---------------------------------------------------------------- 双时点差异
+# 合规状态双时点差异报告的分类：实体（产品 / 回执 / 处置项）在 from / to 两条
+# 事件序号上界下的存在性与状态比较。本系统只追加，故 removed 实际不会出现，
+# 保留该分类以使结果集完备（未来若引入过期清除语义时口径不变）。
+DIFF_CLASSIFICATIONS = ("added", "removed", "changed", "unchanged")
+
+
+def classify_change(from_present: bool, to_present: bool,
+                    from_state, to_state) -> str:
+    """双时点差异分类：added / removed / changed / unchanged。
+
+    * 仅 to 侧存在 -> ``added``；仅 from 侧存在 -> ``removed``；
+    * 两侧均存在：状态比较键不同 -> ``changed``，否则 ``unchanged``。
+
+    :param from_state/to_state: 各侧的状态比较键（可比较的任意值；
+        两侧均不存在时不得调用——该实体不属于差异报告范围）。
+    """
+    if not from_present and not to_present:
+        raise ValueError("两侧均不存在的实体不参与差异分类")
+    if not from_present:
+        return "added"
+    if not to_present:
+        return "removed"
+    return "changed" if from_state != to_state else "unchanged"
+
+
 # ---------------------------------------------------------------- 处置台账
 # 处置项状态机（全部由追加记录派生，不改写任何行）：
 #   open       已开立，接收方尚未提交；

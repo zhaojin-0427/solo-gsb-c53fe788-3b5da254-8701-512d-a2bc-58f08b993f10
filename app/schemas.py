@@ -144,3 +144,38 @@ class AttestationVerifyRequest(BaseModel):
                            description="本地密钥对声明字节的 HMAC-SHA256 签名")
     alg: Optional[str] = Field(
         None, description="签名算法标识；缺省/固定为 HMAC-SHA256")
+
+
+# ------------------------------------------------------------- 合规差异报告
+class ComplianceDiffCreate(BaseModel):
+    """合规状态双时点差异报告请求（只读，不落库，无需幂等键）。
+
+    在两条全局事件序号上界（``from_seq`` < ``to_seq``）下分别重放并比较：
+    from 侧尚未登记的产品标为 absent（分类 added）；未知产品或超过当前
+    最大事件序号的未来序号由服务端拒绝（422）。
+    """
+    subject_id: str = Field(..., min_length=1, description="数据主体")
+    product_ids: list[str] = Field(
+        ..., description="产品范围；必须非空，且均为主体已知产物")
+    use_at: datetime = Field(..., description="报告锚定的使用时点")
+    from_seq: int = Field(..., ge=1,
+                          description="from 侧重放的事件序号上界")
+    to_seq: int = Field(..., ge=1,
+                        description="to 侧重放的事件序号上界；必须大于 from_seq")
+
+    @field_validator("product_ids")
+    @classmethod
+    def _non_empty_products(cls, v):
+        if not v:
+            raise ValueError("产品范围不能为空")
+        if any(not pid or not isinstance(pid, str) for pid in v):
+            raise ValueError("产品 ID 不能为空")
+        return v
+
+    @field_validator("to_seq")
+    @classmethod
+    def _ordered_bounds(cls, v, info):
+        from_seq = info.data.get("from_seq")
+        if from_seq is not None and not from_seq < v:
+            raise ValueError("序号上界要求 from_seq < to_seq")
+        return v

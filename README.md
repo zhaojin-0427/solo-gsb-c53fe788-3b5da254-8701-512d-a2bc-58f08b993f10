@@ -35,6 +35,15 @@
   证明**，`POST /attestations/verify` 验签只依赖声明、摘要、签名与配置
   密钥，**不读取任何可变业务状态**。产品范围为空、含未知产品或越界
   `as_of_seq` 一律拒绝。
+- **合规状态双时点差异报告**：客户端提交 `subject_id`、非空
+  `product_ids`、`use_at` 与两条全局事件序号上界
+  `from_seq < to_seq`，服务在**一个 REPEATABLE READ 只读快照**中分别
+  按两条上界重放许可、撤销、决策回执、血缘产品、处置项与删除结论，
+  返回每个产品及其传递回执的 **added / removed / changed / unchanged**
+  分类、两侧稳定依据与状态翻转原因（可定位到撤销 / 许可 / 处置项序号）；
+  from 侧尚未登记的产品标为 **absent**，未知产品或未来序号拒绝；
+  结果按产品、回执与事件序号稳定排序；**不写入任何业务表**，
+  **后续事件不改变同一 (from_seq, to_seq) 的报告**。
 
 ## 1. 一键启动
 
@@ -102,13 +111,15 @@ compose 为**撤销处置台账**预置了本地开发令牌（可通过环境�
 | POST | `/attestations` | **幂等**生成合规证明：同一快照重放全部依据，规范化声明 + SHA-256 摘要 + HMAC 签名（需 `Idempotency-Key`） |
 | GET  | `/attestations/{id}` | 取回既有证明的声明字节、摘要与签名（不按当前状态重放） |
 | POST | `/attestations/verify` | 独立验签：只依赖声明、摘要、签名与配置密钥，不读取业务状态 |
+| POST | `/compliance-diffs` | 合规状态双时点差异报告：同一快照按 from_seq/to_seq 重放并分类 added/removed/changed/unchanged（只读，不落库） |
 
 错误统一返回 `{"error": {"code", "message"}}`，状态码：
 `401 unauthorized`（缺少 / 无效令牌）、`403 forbidden`（令牌角色或接收方不匹配）、
 `404 not_found` / `409 conflict`（幂等键冲突、grant_id/product_id 重复、
 处置项版本过期 / 已结案）/
 `422 unprocessable_entity`（血缘有环、引用未知、半开区间非法、证据未覆盖关联产物、
-证明产品范围为空 / 含未知产品 / 越界 as_of_seq、验签输入格式非法等）。
+证明产品范围为空 / 含未知产品 / 越界 as_of_seq、验签输入格式非法、
+差异报告产品范围为空 / 含未知产品 / from_seq ≥ to_seq / 未来序号等）。
 
 ## 4. 示例调用
 
@@ -439,6 +450,106 @@ signature_ok = hmac.compare_digest(
 本地默认值，**生产部署务必覆盖**）。密钥是本地对称密钥：服务重启不变
 （声明仍可验签）；轮换密钥后旧签名只能用旧密钥验证。
 
+### 4.9 合规状态双时点差异报告（只读，不落库）
+
+客户端提交主体、**非空**产品范围、`use_at` 与两条全局事件序号上界
+（`from_seq < to_seq`）：
+
+```bash
+curl -sS -X POST localhost:8000/compliance-diffs \
+  -H 'Content-Type: application/json' -d '{
+    "subject_id":"u3",
+    "product_ids":["report-1","report-2"],
+    "use_at":"2026-05-01T00:00:00Z",
+    "from_seq":2,"to_seq":3}'
+```
+
+服务在**一个 REPEATABLE READ 只读快照**中分别按两条上界重放：许可 /
+撤销（`seq <= 上界`）、决策回执与血缘产品（`recorded_seq <= 上界`）、
+处置项（开立 `revocation_seq <= 上界`、取消 `grant_seq <= 上界`）与
+删除结论（范围闭包 + 阻断派生，同 §4.7 / §4.8 口径），然后逐产品、
+逐回执比较两侧状态：
+
+- **分类**：仅 to 侧存在 -> `added`（from 侧尚未登记的产品 / 回执 /
+  处置项，from 侧标 `{"presence":"absent"}`）；仅 from 侧存在 ->
+  `removed`（本系统只追加，实际不出现，分类保持完备）；两侧均存在且
+  状态比较键不同 -> `changed`，否则 `unchanged`；
+- **两侧稳定依据**：产品给出 `recorded_seq` / `task_key` 与两侧
+  `status` / `invalidating_events`；回执给出登记时的不可变决策
+  （`decision`、`basis`、`use_at`、`recorded_seq`）与两侧
+  `currently_valid` / `invalidating_events` / 当前命中许可
+  （`hit_grant`）；处置项给出 `revocation_seq`、关联产物与两侧状态；
+  删除结论给出两侧 `scope` / `status` / `blockers` / `batches`；
+- **状态翻转原因**（可定位）：回执 `revoked`（新增失效撤销的序号、
+  grant_id、业务生效时间）与 `hit_grant_changed`（命中许可切换——
+  新许可恢复有效或更新许可取代旧命中）；产品 `status_flip`（含
+  `causing_receipts`）；处置项 `opened`（revocation_seq）/
+  `cancelled`（grant_seq）；删除结论 `blocker_added` /
+  `blocker_removed`（阻断原因身份）/ `scope_changed` 等。
+
+响应骨架（撤销落入区间时）：
+
+```json
+{"subject_id":"u3","use_at":"2026-05-01T00:00:00+00:00",
+ "from_seq":2,"to_seq":3,"from_basis_seq":2,"to_basis_seq":3,
+ "summary":{"products":{"added":0,"removed":0,"changed":2,"unchanged":0},
+            "receipts":{"added":0,"removed":0,"changed":1,"unchanged":0},
+            "remediation_items":{"added":1,"removed":0,"changed":0,"unchanged":0},
+            "deletion":"changed"},
+ "products":[{"product_id":"report-1","classification":"changed",
+   "recorded_seq":2,"task_key":"u3-task-1",
+   "from":{"presence":"present","status":"active","invalidating_events":[]},
+   "to":{"presence":"present","status":"blocked","invalidating_events":[3]},
+   "flip_reasons":[{"kind":"status_flip","from_status":"active",
+     "to_status":"blocked","invalidating_events":[3],
+     "causing_receipts":["u3-task-1"]}],
+   "receipts":[{"receipt_key":"u3-task-1","classification":"changed",
+     "decision":"allow","basis":{"grant_id":"g1","seq":1,"reason":"grant"},
+     "use_at":"2026-05-01T00:00:00+00:00","recorded_seq":2,
+     "from":{"presence":"present","currently_valid":true,
+             "invalidating_events":[],"hit_grant":{"grant_id":"g1","grant_seq":1}},
+     "to":{"presence":"present","currently_valid":false,
+           "invalidating_events":[3],"hit_grant":{"grant_id":"g1","grant_seq":1}},
+     "flip_reasons":[{"kind":"revoked","revocation_seq":3,"grant_id":"g1",
+                      "business_effective_at":"2026-01-15T00:00:00+00:00"}]}]}],
+ "remediation_items":[{"item_id":1,"receipt_key":"u3-task-1",
+   "recipient":"partner-a","revocation_seq":3,"products":["report-1","report-2"],
+   "classification":"added","from":{"presence":"absent"},
+   "to":{"presence":"present","status":"open"},
+   "flip_reasons":[{"kind":"opened","revocation_seq":3}]}],
+ "deletion":{"classification":"changed",
+   "from":{"scope":["report-1","report-2"],"status":"blocked",
+           "blockers":[{"kind":"active_grant","grant_id":"g1","grant_seq":1,
+                        "receipt_key":"u3-task-1","products":["report-1","report-2"],
+                        "category":"email","purpose":"marketing",
+                        "recipient":"partner-a"}],"batches":[]},
+   "to":{"scope":["report-1","report-2"],"status":"blocked",
+         "blockers":[{"kind":"open_remediation","item_id":1,
+                      "receipt_key":"u3-task-1","recipient":"partner-a",
+                      "status":"open","products":["report-1","report-2"]}],
+         "batches":[]},
+   "flip_reasons":[{"kind":"blocker_removed","blocker":{"kind":"active_grant",...}},
+                   {"kind":"blocker_added","blocker":{"kind":"open_remediation",...}}]}}
+```
+
+语义与保证：
+
+- **后续事件不改变报告**：两侧口径完全由事件序号界定（事件、回执 /
+  产物的 `recorded_seq`、处置项开立 `revocation_seq` 与取消
+  `grant_seq` 均按上界过滤），同一 `(from_seq, to_seq)` 重复签发
+  逐字节一致，与独立只读 `?as_of_seq=` 回放口径相同；并发追加事件
+  （含其他主体）不影响报告——跨主体事件从不纳入；
+- **处置证据提交 / 复核不携带事件序号**（不是许可 / 撤销事件）：报告
+  按请求时点快照原样反映其派生状态（与 §4.7 删除计划查询的口径一致），
+  而全部**事件驱动**状态严格按上界过滤；
+- `use_at` 是报告锚定的使用时点（随响应回显）；各回执仍按其自身登记
+  的 `use_at` 重放（与产品状态、删除计划、合规证明口径一致）；
+- **只读**：不写入任何业务表（无需幂等键），结果按产品 ID、回执键与
+  事件序号稳定排序；
+- **校验**：产品范围为空 `422`；`from_seq >= to_seq` `422`；`to_seq`
+  超过当前全局最大事件序号（未来序号）`422`；含主体未知产品 `422`；
+  产品在 `to_seq` 之后才登记（两侧快照均不存在）`422`。
+
 ### 一键跑完整演示
 
 ```bash
@@ -451,7 +562,9 @@ BASE_URL=http://localhost:8000 ./scripts/demo.sh
 撤销处置台账开立 → 接收方提交/驳回/补证/批准 → 案件结案 →
 处置结案使登记时 blocked 的删除请求变 stale → 新幂等键重新评估放行 →
 删除请求放行（下游先删批次）→ 新许可使计划过期 → 重新评估被活动许可阻断 →
-合规证明生成 / 同键重放 / 取回 / 在线与离线独立验签 / 篡改检测 / 校验拒绝。
+合规证明生成 / 同键重放 / 取回 / 在线与离线独立验签 / 篡改检测 / 校验拒绝 →
+合规状态双时点差异报告（撤销 / 恢复 / 新增产品落入区间的分类与翻转原因、
+后续事件不改变报告、校验拒绝）。
 
 ## 5. 并发与不可变性
 
@@ -513,12 +626,21 @@ BASE_URL=http://localhost:8000 ./scripts/demo.sh
   前者只取登记时保存的字节 / 摘要 / 签名（不重放），后者**完全不访问
   数据库**——验签仅凭提交字节与配置密钥，因此证明的可验证性不受后续业务
   状态变化、运维改库（篡改字节只会使验签失败）或服务重启影响。
+- **合规差异报告**（`POST /compliance-diffs`）使用
+  `REPEATABLE READ ... READ ONLY` 单快照：两侧（from_seq / to_seq）在
+  **同一事务快照**内分别按序号上界重放，不取主体咨询锁、不写任何业务表。
+  由于 `seq <= to_seq` 的事件、回执、产物与处置记录全部不可变，并发
+  追加的许可 / 撤销（序号必大于 to_seq）对报告不可见——同一
+  `(from_seq, to_seq)` 的报告在任意时刻重发逐字节一致；跨主体事件经
+  `subject_id` 过滤从不纳入。处置证据提交 / 复核不携带事件序号，其
+  派生状态按请求时点快照计入（与删除计划查询的口径一致）。
 
 ## 6. 测试
 
 纯领域逻辑（确定性重放、半开区间、替代依据组、血缘传播、解释排序、无环检测、
 血缘传递依赖、处置项 / 案件状态机、删除范围下游闭包、删除批次分层、
-历史 / 当前结论比较（过期判定）、合规证明规范序列化 / 摘要 / HMAC 验签）
+历史 / 当前结论比较（过期判定）、合规证明规范序列化 / 摘要 / HMAC 验签、
+双时点差异分类 added/removed/changed/unchanged）
 不依赖第三方库，可直接运行：
 
 ```bash
@@ -574,6 +696,15 @@ DATABASE_URL=postgresql://consent:consent@localhost:5432/consent \
   （多证明与撤销并发：同 `as_of_seq` 证明逐字节一致且与独立只读回放口径
   相同，撤销后证明不同而历史证明不改写）；**篡改持久层字节**后验签如实
   失败且验签不读库（未篡改字节 + 原签名仍通过）。
+- **合规差异报告**端到端：撤销 / 恢复许可 / 新产品落入区间时的
+  added / changed / unchanged 分类与翻转原因定位（撤销序号、命中许可
+  切换、处置开立 / 取消、删除阻断身份变化）、from 侧 absent、汇总计数；
+  空范围 / from_seq ≥ to_seq / 未来序号 / 未知产品 / 产品晚于 to_seq
+  登记的 422 拒绝；跨主体事件与无关事件不误纳入（全部 unchanged、
+  basis_seq 只计本主体事件）；处置提交 / 复核按请求快照反映而事件
+  严格有界；只读性（任何业务表行数不变）与可重复性（逐字节一致）；
+  **并发追加事件（含跨主体）下同一 (from_seq, to_seq) 报告与基线逐字节
+  一致**，且两侧与独立只读 `?as_of_seq=` 回放口径相同。
 
 ## 7. 目录结构
 
@@ -581,13 +712,13 @@ DATABASE_URL=postgresql://consent:consent@localhost:5432/consent \
 app/
   config.py       运行配置（环境变量；含处置台账管理员 / 接收方令牌与证明 HMAC 密钥）
   db.py           psycopg3 连接池、事务上下文（隔离级别/只读/主体咨询锁）与启动建表
-  domain.py       纯领域逻辑：双时点重放 + 血缘阻断 + 处置项状态机 + 删除批次/结论比较（可单测）
+  domain.py       纯领域逻辑：双时点重放 + 血缘阻断 + 处置项状态机 + 删除批次/结论比较 + 双时点差异分类（可单测）
   attestation.py  合规证明：规范 JSON 序列化、SHA-256 摘要、HMAC-SHA256 签名与独立验签（可单测）
   repository.py   只追加 SQL 访问层（事件 / 回执 / 产物 / 处置台账 / 删除请求 / 合规证明）
-  service.py      事件追加 / 确定性重放 / 幂等登记 / 撤销传播 / 处置台账 / 删除计划 / 证明编排
+  service.py      事件追加 / 确定性重放 / 幂等登记 / 撤销传播 / 处置台账 / 删除计划 / 证明编排 / 双时点差异报告
   schemas.py      Pydantic 请求模型
   main.py         FastAPI 路由与 Bearer 令牌鉴权
 sql/schema.sql    追加式表结构（含处置项、证据、复核决定、取消记录、删除请求与计划、合规证明）
-scripts/demo.sh   端到端示例脚本（含处置台账提交 / 复核 / 结案、删除计划过期与合规证明验签）
-tests/            领域单元测试 + 证明加密单元测试 + API 集成测试（端到端、处置台账、删除请求、证明与并发回归）
+scripts/demo.sh   端到端示例脚本（含处置台账提交 / 复核 / 结案、删除计划过期、合规证明验签与差异报告）
+tests/            领域单元测试 + 证明加密单元测试 + API 集成测试（端到端、处置台账、删除请求、证明、差异报告与并发回归）
 ```

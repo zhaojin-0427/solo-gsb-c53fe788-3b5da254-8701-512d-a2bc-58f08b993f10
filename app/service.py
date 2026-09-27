@@ -511,8 +511,16 @@ class Service:
             raise not_found(f"处置项 {item_id} 不存在")
         return item["subject_id"]
 
-    def _remediation_state(self, subject_id: str) -> dict[int, dict]:
-        """加载主体全部处置项及其追加记录，派生每项状态。"""
+    def _remediation_state(self, subject_id: str,
+                           cancel_upto_grant_seq: Optional[int] = None
+                           ) -> dict[int, dict]:
+        """加载主体全部处置项及其追加记录，派生每项状态。
+
+        :param cancel_upto_grant_seq: 不为 None 时，取消记录按事件序号上界
+            过滤（``grant_seq`` 超过上界的取消对该侧不可见）——双时点差异
+            报告按序号上界重放取消；提交 / 复核不携带事件序号（不是事件），
+            始终按请求快照原样计入。
+        """
         items = self.repo.list_remediation_items(subject_id)
         if not items:
             return {}
@@ -539,6 +547,10 @@ class Service:
             subs = subs_by_item.get(iid, [])
             reviews = reviews_by_item.get(iid, {})
             cancel = cancel_by_item.get(iid)
+            if (cancel is not None and cancel_upto_grant_seq is not None
+                    and cancel["grant_seq"] > cancel_upto_grant_seq):
+                # 序号上界之外的取消记录对该侧不可见（后续事件不改变报告）。
+                cancel = None
             status = domain.remediation_item_status(
                 cancelled=cancel is not None,
                 submission_versions=[s["version"] for s in subs],
@@ -1104,6 +1116,400 @@ class Service:
         if replayed is not None:
             result["idempotent_replay"] = replayed
         return result
+
+    # ============================================================== 合规差异报告
+    def compliance_diff(self, req) -> dict:
+        """合规状态双时点差异报告（只读；不写任何业务表）。
+
+        路由在同一个 REPEATABLE READ 只读快照中调用本方法：分别按两条全局
+        事件序号上界（``from_seq < to_seq``）重放许可 / 撤销、决策回执、
+        血缘产品、处置项与删除结论，返回每个产品及其传递回执的
+        added / removed / changed / unchanged 分类、两侧稳定依据与状态翻转
+        原因。
+
+        * 两侧口径完全由事件序号界定：事件本身、回执（recorded_seq）、
+          产物（recorded_seq）、处置项开立（revocation_seq）与取消
+          （grant_seq）均按上界过滤——后续追加事件永不改变同一
+          (from_seq, to_seq) 的报告；处置证据提交 / 复核不携带事件序号
+          （不是事件），按请求快照原样计入两侧处置状态；
+        * from 侧尚未登记的产品标为 absent（分类 added）；未知产品或超过
+          当前最大事件序号的未来序号一律 422；
+        * 结果按产品 ID、回执键与事件序号稳定排序。
+        """
+        requested = sorted(set(req.product_ids))
+        use_at = utc(req.use_at)
+        from_seq, to_seq = req.from_seq, req.to_seq
+        if from_seq >= to_seq:
+            raise unprocessable("序号上界要求 from_seq < to_seq")
+        # 未来序号：序号是全局单调序号，超过当前最大序号的 to_seq 在任何
+        # 主体的快照中都无意义，必须拒绝（from_seq < to_seq 随之合法）。
+        max_seq = self.repo.max_event_seq()
+        if to_seq > max_seq:
+            raise unprocessable(
+                f"to_seq 越界：当前最大事件序号为 {max_seq}")
+
+        all_products, meta, products_rows, _, _ = self._load_product_graph(
+            req.subject_id)
+        unknown = [pid for pid in requested if pid not in all_products]
+        if unknown:
+            raise unprocessable("未知产物: " + ", ".join(unknown))
+        recorded_seq_by_pid = {p["product_id"]: p["recorded_seq"]
+                               for p in products_rows}
+        future = [pid for pid in requested
+                  if recorded_seq_by_pid[pid] > to_seq]
+        if future:
+            raise unprocessable(
+                "to_seq 早于以下产物的登记序号（两侧快照中均不存在）: "
+                + ", ".join(sorted(future)))
+
+        events = self._subject_events(req.subject_id)
+        events_by_seq = {e.seq: e for e in events}
+        receipt_rows = {
+            r["idempotency_key"]: r
+            for r in self.repo.get_receipts_for_subject(req.subject_id)}
+
+        from_side = self._diff_side(req.subject_id, from_seq, events,
+                                    receipt_rows, all_products,
+                                    recorded_seq_by_pid, requested)
+        to_side = self._diff_side(req.subject_id, to_seq, events,
+                                  receipt_rows, all_products,
+                                  recorded_seq_by_pid, requested)
+
+        # ---- 逐产品差异：传递回执在完整血缘图上取（产品于 to 侧必存在） ----
+        product_entries = []
+        receipt_class_union: dict[str, str] = {}
+        for pid in requested:
+            entry, receipt_classes = self._diff_product(
+                pid, meta[pid], all_products, receipt_rows,
+                from_side, to_side, events_by_seq)
+            product_entries.append(entry)
+            receipt_class_union.update(receipt_classes)
+
+        # ---- 处置项差异：范围为全部请求产品的传递回执并集 ----
+        scope_receipts: set[str] = set()
+        for pid in requested:
+            scope_receipts |= domain.transitive_receipts(all_products, pid)
+        remediation_entries = self._diff_remediation(
+            from_side, to_side, scope_receipts)
+
+        deletion = self._diff_deletion(from_side["deletion"],
+                                       to_side["deletion"])
+
+        return {
+            "subject_id": req.subject_id,
+            "use_at": use_at.isoformat(),
+            "from_seq": from_seq,
+            "to_seq": to_seq,
+            "from_basis_seq": from_side["basis_seq"],
+            "to_basis_seq": to_side["basis_seq"],
+            "summary": {
+                "products": _class_counts(
+                    p["classification"] for p in product_entries),
+                "receipts": _class_counts(receipt_class_union.values()),
+                "remediation_items": _class_counts(
+                    e["classification"] for e in remediation_entries),
+                "deletion": deletion["classification"],
+            },
+            "products": product_entries,
+            "remediation_items": remediation_entries,
+            "deletion": deletion,
+        }
+
+    def _diff_side(self, subject_id: str, bound: int,
+                   events: list[domain.Event], receipt_rows: dict,
+                   all_products: dict, recorded_seq_by_pid: dict,
+                   requested: list[str]) -> dict:
+        """在单一事件序号上界一侧重放全部依据（同一快照内被调用两次）。
+
+        回执 / 产物按 recorded_seq、处置项按 revocation_seq（开立）与
+        grant_seq（取消）过滤到上界；许可 / 撤销重放只取 seq <= bound 的
+        事件。返回该侧的回执快照、产物评估、处置条目与删除结论。
+        """
+        visible_events = [e for e in events if e.seq <= bound]
+        basis_seq = max((e.seq for e in visible_events), default=0)
+        side_rows = [r for r in receipt_rows.values()
+                     if r["recorded_seq"] <= bound]
+        receipt_snaps = {
+            r["idempotency_key"]: self._diff_receipt_snapshot(r, events, bound)
+            for r in side_rows}
+        receipt_states = {
+            key: domain.ReceiptState(key, snap["currently_valid"],
+                                     tuple(snap["invalidating_events"]),
+                                     snap["detail"])
+            for key, snap in receipt_snaps.items()}
+        present_pids = {pid for pid in all_products
+                        if recorded_seq_by_pid[pid] <= bound}
+        graph = {pid: groups for pid, groups in all_products.items()
+                 if pid in present_pids}
+        evaluations = domain.evaluate_product_graph(graph, receipt_states)
+        remediation = {
+            e["item"]["item_id"]: e
+            for e in self._remediation_state(
+                subject_id, cancel_upto_grant_seq=bound).values()
+            if e["item"]["revocation_seq"] <= bound}
+        seeds = [pid for pid in requested if pid in present_pids]
+        scope = sorted(domain.downstream_closure(graph, seeds))
+        blockers = self._blockers_from(
+            scope, visible_events, products=graph, receipt_rows=side_rows,
+            remediation_entries=remediation.values())
+        deletion = {
+            "scope": scope,
+            "status": "blocked" if blockers else "planned",
+            "blockers": blockers,
+            "batches": [] if blockers else [
+                {"batch_no": no, "product_ids": pids}
+                for no, pids in enumerate(
+                    domain.deletion_batches(graph, scope), start=1)],
+        }
+        return {"bound": bound, "basis_seq": basis_seq,
+                "receipts": receipt_snaps, "evaluations": evaluations,
+                "present_pids": present_pids, "remediation": remediation,
+                "deletion": deletion}
+
+    def _diff_receipt_snapshot(self, row: dict, events: list[domain.Event],
+                               bound: int) -> dict:
+        """回执在序号上界一侧的重放快照（含命中许可这一稳定依据）。"""
+        if row["decision"] == "deny":
+            # 登记时即被拒绝：永久无效，失效事件集合为空。
+            return {"currently_valid": False, "invalidating_events": [],
+                    "hit_grant": None,
+                    "detail": f"registered deny ({row['basis_reason']})"}
+        dec = domain.decide(
+            events,
+            subject_id=row["subject_id"], category=row["category"],
+            purpose=row["purpose"], recipient=row["recipient"],
+            use_at=utc(row["use_at"]).isoformat(), as_of_seq=bound)
+        hit = ({"grant_id": dec.grant.grant_id, "grant_seq": dec.grant.seq}
+               if dec.grant is not None else None)
+        if dec.outcome == "allow":
+            return {"currently_valid": True, "invalidating_events": [],
+                    "hit_grant": hit, "detail": ""}
+        return {"currently_valid": False,
+                "invalidating_events":
+                    [dec.revocation.seq] if dec.reason == "revoked" else [],
+                "hit_grant": hit, "detail": dec.reason}
+
+    def _diff_product(self, pid: str, meta_row: dict, all_products: dict,
+                      receipt_rows: dict, from_side: dict, to_side: dict,
+                      events_by_seq: dict) -> tuple[dict, dict]:
+        """单个产品的双时点差异（含其传递回执），返回 (产品条目, 回执分类)。"""
+        from_present = pid in from_side["present_pids"]
+        to_present = pid in to_side["present_pids"]
+        from_view = self._product_view(from_side, pid, from_present)
+        to_view = self._product_view(to_side, pid, to_present)
+        classification = domain.classify_change(
+            from_present, to_present,
+            _product_state_key(from_view), _product_state_key(to_view))
+
+        # 传递回执：产品的血缘登记后不可变，任一侧存在的闭包相同。
+        receipt_entries = []
+        receipt_classes: dict[str, str] = {}
+        for rkey in sorted(domain.transitive_receipts(all_products, pid)):
+            entry = self._diff_receipt(rkey, receipt_rows[rkey],
+                                       from_side, to_side, events_by_seq)
+            receipt_entries.append(entry)
+            receipt_classes[rkey] = entry["classification"]
+
+        reasons: list[dict] = []
+        if classification == "added":
+            reasons.append({"kind": "registered",
+                            "recorded_seq": meta_row["recorded_seq"],
+                            "task_key": meta_row["task_key"]})
+        elif classification == "changed":
+            if from_view["status"] != to_view["status"]:
+                reasons.append({
+                    "kind": "status_flip",
+                    "from_status": from_view["status"],
+                    "to_status": to_view["status"],
+                    "invalidating_events": to_view["invalidating_events"],
+                    "causing_receipts": sorted(
+                        k for k, c in receipt_classes.items()
+                        if c != "unchanged")})
+            else:
+                reasons.append({
+                    "kind": "invalidating_events_changed",
+                    "from_invalidating_events":
+                        from_view["invalidating_events"],
+                    "to_invalidating_events": to_view["invalidating_events"]})
+        return ({
+            "product_id": pid,
+            "classification": classification,
+            "recorded_seq": meta_row["recorded_seq"],
+            "task_key": meta_row["task_key"],
+            "from": from_view,
+            "to": to_view,
+            "flip_reasons": reasons,
+            "receipts": receipt_entries,
+        }, receipt_classes)
+
+    @staticmethod
+    def _product_view(side: dict, pid: str, present: bool) -> dict:
+        if not present:
+            return {"presence": "absent"}
+        node = side["evaluations"][pid]
+        return {"presence": "present",
+                "status": "active" if node.active else "blocked",
+                "invalidating_events": list(node.invalidating_seqs)}
+
+    def _diff_receipt(self, rkey: str, row: dict, from_side: dict,
+                      to_side: dict, events_by_seq: dict) -> dict:
+        """单条传递回执的双时点差异：分类、两侧重放状态与翻转原因。"""
+        from_snap = from_side["receipts"].get(rkey)
+        to_snap = to_side["receipts"].get(rkey)
+        from_view = self._receipt_view(from_snap)
+        to_view = self._receipt_view(to_snap)
+        classification = domain.classify_change(
+            from_snap is not None, to_snap is not None,
+            _receipt_state_key(from_snap), _receipt_state_key(to_snap))
+
+        reasons: list[dict] = []
+        if classification == "added":
+            reasons.append({"kind": "registered",
+                            "recorded_seq": row["recorded_seq"]})
+        elif classification == "changed":
+            from_inv = set(from_snap["invalidating_events"])
+            to_inv = set(to_snap["invalidating_events"])
+            for seq in sorted(to_inv - from_inv):
+                ev = events_by_seq[seq]
+                reasons.append({
+                    "kind": "revoked", "revocation_seq": seq,
+                    "grant_id": ev.revoke_grant,
+                    "business_effective_at": ev.business_effective_at})
+            if from_snap["hit_grant"] != to_snap["hit_grant"]:
+                # 命中许可变化：新许可恢复有效（invalid -> valid）或同四元组
+                # 的更新许可取代旧命中（两侧有效性可能不变）。
+                reasons.append({"kind": "hit_grant_changed",
+                                "from_grant": from_snap["hit_grant"],
+                                "to_grant": to_snap["hit_grant"]})
+        return {
+            "receipt_key": rkey,
+            "classification": classification,
+            "decision": row["decision"],
+            "basis": {"grant_id": row["basis_grant_id"],
+                      "seq": row["basis_seq"],
+                      "reason": row["basis_reason"]},
+            "use_at": utc(row["use_at"]).isoformat(),
+            "recorded_seq": row["recorded_seq"],
+            "from": from_view,
+            "to": to_view,
+            "flip_reasons": reasons,
+        }
+
+    @staticmethod
+    def _receipt_view(snap: Optional[dict]) -> dict:
+        if snap is None:
+            return {"presence": "absent"}
+        return {"presence": "present",
+                "currently_valid": snap["currently_valid"],
+                "invalidating_events": list(snap["invalidating_events"]),
+                "hit_grant": snap["hit_grant"]}
+
+    def _diff_remediation(self, from_side: dict, to_side: dict,
+                          scope_receipts: set[str]) -> list[dict]:
+        """范围内回执的处置项双时点差异（按 item_id 稳定排序）。
+
+        两侧状态差异只能来自序号可定位的记录：开立（revocation_seq 落入
+        (from, to] -> added）与取消（grant_seq 落入 (from, to] -> changed）；
+        提交 / 复核不携带事件序号，两侧一致。
+        """
+        entries: list[dict] = []
+        item_ids = sorted(set(from_side["remediation"])
+                          | set(to_side["remediation"]))
+        for iid in item_ids:
+            from_entry = from_side["remediation"].get(iid)
+            to_entry = to_side["remediation"].get(iid)
+            item = (to_entry or from_entry)["item"]
+            if item["receipt_key"] not in scope_receipts:
+                continue
+            classification = domain.classify_change(
+                from_entry is not None, to_entry is not None,
+                from_entry["status"] if from_entry else None,
+                to_entry["status"] if to_entry else None)
+            reasons: list[dict] = []
+            if classification == "added":
+                reasons.append({"kind": "opened",
+                                "revocation_seq": item["revocation_seq"]})
+            elif classification == "changed":
+                cancel = to_entry["cancellation"]
+                if cancel is not None:
+                    reasons.append({"kind": "cancelled",
+                                    "grant_seq": cancel["grant_seq"]})
+                else:  # 防御性：序号可定位记录之外的状态差异。
+                    reasons.append({"kind": "status_flip",
+                                    "from_status": from_entry["status"],
+                                    "to_status": to_entry["status"]})
+            entries.append({
+                "item_id": iid,
+                "receipt_key": item["receipt_key"],
+                "recipient": item["recipient"],
+                "revocation_seq": item["revocation_seq"],
+                "products": sorted((to_entry or from_entry)["products"]),
+                "classification": classification,
+                "from": _remediation_view(from_entry),
+                "to": _remediation_view(to_entry),
+                "flip_reasons": reasons,
+            })
+        return entries
+
+    def _diff_deletion(self, from_del: dict, to_del: dict) -> dict:
+        """删除结论的双时点差异：状态、阻断原因身份、范围与批次比较。"""
+        from_ids = {domain.deletion_blocker_identity(b): b
+                    for b in from_del["blockers"]}
+        to_ids = {domain.deletion_blocker_identity(b): b
+                  for b in to_del["blockers"]}
+        changed = (from_del["status"] != to_del["status"]
+                   or set(from_ids) != set(to_ids)
+                   or from_del["scope"] != to_del["scope"]
+                   or from_del["batches"] != to_del["batches"])
+        reasons: list[dict] = []
+        if from_del["status"] != to_del["status"]:
+            reasons.append({"kind": "status_flip",
+                            "from_status": from_del["status"],
+                            "to_status": to_del["status"]})
+        for ident in sorted(set(to_ids) - set(from_ids)):
+            reasons.append({"kind": "blocker_added",
+                            "blocker": to_ids[ident]})
+        for ident in sorted(set(from_ids) - set(to_ids)):
+            reasons.append({"kind": "blocker_removed",
+                            "blocker": from_ids[ident]})
+        from_scope, to_scope = set(from_del["scope"]), set(to_del["scope"])
+        if from_scope != to_scope:
+            reasons.append({
+                "kind": "scope_changed",
+                "added": sorted(to_scope - from_scope),
+                "removed": sorted(from_scope - to_scope)})
+        return {"classification": "changed" if changed else "unchanged",
+                "from": from_del, "to": to_del, "flip_reasons": reasons}
+
+
+def _product_state_key(view: dict):
+    """产品差异比较键：派生状态 + 失效事件集合。"""
+    if view["presence"] == "absent":
+        return None
+    return (view["status"], tuple(view["invalidating_events"]))
+
+
+def _receipt_state_key(snap: Optional[dict]):
+    """回执差异比较键：有效性 + 失效事件集合 + 当前命中许可身份。"""
+    if snap is None:
+        return None
+    hit = snap["hit_grant"]
+    return (snap["currently_valid"], tuple(snap["invalidating_events"]),
+            hit["grant_seq"] if hit else None)
+
+
+def _remediation_view(entry: Optional[dict]) -> dict:
+    if entry is None:
+        return {"presence": "absent"}
+    return {"presence": "present", "status": entry["status"]}
+
+
+def _class_counts(classifications) -> dict:
+    """分类计数（added / removed / changed / unchanged）。"""
+    counts = {c: 0 for c in domain.DIFF_CLASSIFICATIONS}
+    for c in classifications:
+        counts[c] += 1
+    return counts
 
 
 def _submission_dict(sub: dict) -> dict:

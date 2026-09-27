@@ -2255,5 +2255,429 @@ class AttestationApiTests(unittest.TestCase):
         self.assertTrue(vr.json()["valid"])
 
 
+@unittest.skipIf(TestClient is None, "缺少 fastapi/psycopg 依赖")
+class ComplianceDiffApiTests(unittest.TestCase):
+    """合规状态双时点差异报告端到端：双时点重放、added/removed/changed/
+    unchanged 分类、翻转原因定位、校验拒绝、只读性、后续事件不改变报告，
+    以及并发追加事件下两侧快照一致、跨主体事件不误纳入。"""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault(
+            "DATABASE_URL", "postgresql://consent:consent@localhost:5432/consent")
+        for attempt in range(30):
+            try:
+                init_pool()
+                break
+            except Exception:
+                if attempt == 29:
+                    raise
+                time.sleep(1)
+        cls.client = TestClient(app)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutdown_pool()
+
+    def setUp(self):
+        self.subject = "diff-" + uuid.uuid4().hex[:12]
+        self.tag = uuid.uuid4().hex[:8]
+
+    def k(self, name: str) -> str:
+        return f"{name}-{self.tag}"
+
+    def _grant(self, gid, recipient="partner-a", category="email"):
+        r = self.client.post("/grants", json={
+            "subject_id": self.subject, "grant_id": gid,
+            "category": category, "purpose": "marketing",
+            "recipient": recipient,
+            "valid_from": "2026-01-01T00:00:00Z"})
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def _task(self, key, products, recipient="partner-a"):
+        r = self.client.post("/tasks", json={
+            "subject_id": self.subject, "category": "email",
+            "purpose": "marketing", "recipient": recipient,
+            "use_at": "2026-05-01T00:00:00Z", "products": products},
+            headers={"Idempotency-Key": key})
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def _revoke(self, gid, bea="2026-01-15T00:00:00Z"):
+        r = self.client.post("/revocations", json={
+            "subject_id": self.subject, "grant_id": gid,
+            "business_effective_at": bea})
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def _diff(self, pids, from_seq, to_seq, expected=(200,)):
+        r = self.client.post("/compliance-diffs", json={
+            "subject_id": self.subject, "product_ids": pids,
+            "use_at": "2026-05-01T00:00:00Z",
+            "from_seq": from_seq, "to_seq": to_seq})
+        self.assertIn(r.status_code, expected, r.text)
+        return r
+
+    # ------------------------------------------------ 全周期：分类与翻转原因
+    def test_diff_lifecycle_classification_and_locatable_reasons(self):
+        g1 = self._grant("g1")["seq"]
+        t1, p1, p2 = self.k("t1"), self.k("p1"), self.k("p2")
+        self._task(t1, [
+            {"product_id": p1, "groups": [[{"kind": "receipt", "ref": t1}]]},
+            {"product_id": p2, "groups": [[{"kind": "product", "ref": p1}]]}])
+        rev_seq = self._revoke("g1")["event"]["seq"]
+
+        # ---- diff(g1, rev)：追溯撤销落入区间，范围乱序提交 -> 稳定排序输出。
+        d = self._diff([p2, p1, p1], g1, rev_seq).json()
+        self.assertEqual(d["subject_id"], self.subject)
+        self.assertEqual(d["from_seq"], g1)
+        self.assertEqual(d["to_seq"], rev_seq)
+        self.assertEqual(d["from_basis_seq"], g1)
+        self.assertEqual(d["to_basis_seq"], rev_seq)
+        self.assertEqual([p["product_id"] for p in d["products"]], [p1, p2])
+        for entry, expect_receipts in ((d["products"][0], [t1]),
+                                       (d["products"][1], [t1])):
+            self.assertEqual(entry["classification"], "changed")
+            self.assertEqual(entry["from"]["presence"], "present")
+            self.assertEqual(entry["from"]["status"], "active")
+            self.assertEqual(entry["to"]["status"], "blocked")
+            self.assertEqual(entry["to"]["invalidating_events"], [rev_seq])
+            flip = entry["flip_reasons"][0]
+            self.assertEqual(flip["kind"], "status_flip")
+            self.assertEqual(flip["from_status"], "active")
+            self.assertEqual(flip["to_status"], "blocked")
+            self.assertEqual(flip["causing_receipts"], expect_receipts)
+        # 传递回执：valid -> invalid，翻转原因定位到撤销事件（含业务生效时间）。
+        rec = d["products"][0]["receipts"][0]
+        self.assertEqual(rec["receipt_key"], t1)
+        self.assertEqual(rec["classification"], "changed")
+        self.assertEqual(rec["decision"], "allow")
+        self.assertEqual(rec["basis"]["grant_id"], "g1")
+        self.assertEqual(rec["basis"]["seq"], g1)
+        self.assertTrue(rec["from"]["currently_valid"])
+        self.assertFalse(rec["to"]["currently_valid"])
+        self.assertEqual(rec["to"]["invalidating_events"], [rev_seq])
+        self.assertEqual(rec["to"]["hit_grant"],
+                         {"grant_id": "g1", "grant_seq": g1})
+        self.assertEqual(rec["flip_reasons"][0]["kind"], "revoked")
+        self.assertEqual(rec["flip_reasons"][0]["revocation_seq"], rev_seq)
+        self.assertEqual(rec["flip_reasons"][0]["grant_id"], "g1")
+        # 处置项：added，开立于 rev_seq，取消记录（更晚序号）对该侧不可见。
+        self.assertEqual(len(d["remediation_items"]), 1)
+        item = d["remediation_items"][0]
+        self.assertEqual(item["classification"], "added")
+        self.assertEqual(item["receipt_key"], t1)
+        self.assertEqual(item["revocation_seq"], rev_seq)
+        self.assertEqual(item["from"], {"presence": "absent"})
+        self.assertEqual(item["to"]["status"], "open")
+        self.assertEqual(item["flip_reasons"],
+                         [{"kind": "opened", "revocation_seq": rev_seq}])
+        self.assertEqual(item["products"], [p1, p2])
+        # 删除结论：active_grant(g1) -> open_remediation，阻断身份可定位。
+        self.assertEqual(d["deletion"]["classification"], "changed")
+        self.assertEqual(d["deletion"]["from"]["status"], "blocked")
+        self.assertEqual([b["kind"] for b in d["deletion"]["from"]["blockers"]],
+                         ["active_grant"])
+        self.assertEqual(d["deletion"]["from"]["blockers"][0]["grant_id"], "g1")
+        self.assertEqual([b["kind"] for b in d["deletion"]["to"]["blockers"]],
+                         ["open_remediation"])
+        kinds = [r["kind"] for r in d["deletion"]["flip_reasons"]]
+        self.assertIn("blocker_removed", kinds)
+        self.assertIn("blocker_added", kinds)
+        # 汇总计数（removed 恒 0：只追加）。
+        self.assertEqual(d["summary"]["products"],
+                         {"added": 0, "removed": 0, "changed": 2,
+                          "unchanged": 0})
+        self.assertEqual(d["summary"]["receipts"]["changed"], 1)
+        self.assertEqual(d["summary"]["remediation_items"]["added"], 1)
+        self.assertEqual(d["summary"]["deletion"], "changed")
+
+        # ---- 恢复许可 + 新产品：diff(rev, g2) 回摆；diff(g1, g2) 见 added。
+        g2 = self._grant("g2")["seq"]
+        t2, p3 = self.k("t2"), self.k("p3")
+        self._task(t2, [{"product_id": p3,
+                         "groups": [[{"kind": "receipt", "ref": t2}]]}])
+
+        d2 = self._diff([p1], rev_seq, g2).json()
+        rec2 = d2["products"][0]["receipts"][0]
+        self.assertEqual(rec2["classification"], "changed")
+        self.assertFalse(rec2["from"]["currently_valid"])
+        self.assertTrue(rec2["to"]["currently_valid"])
+        self.assertEqual(rec2["flip_reasons"],
+                         [{"kind": "hit_grant_changed",
+                           "from_grant": {"grant_id": "g1", "grant_seq": g1},
+                           "to_grant": {"grant_id": "g2", "grant_seq": g2}}])
+        self.assertEqual(d2["products"][0]["to"]["status"], "active")
+        item2 = d2["remediation_items"][0]
+        self.assertEqual(item2["classification"], "changed")
+        self.assertEqual(item2["from"]["status"], "open")
+        self.assertEqual(item2["to"]["status"], "cancelled")
+        self.assertEqual(item2["flip_reasons"],
+                         [{"kind": "cancelled", "grant_seq": g2}])
+        self.assertEqual([b["kind"] for b in d2["deletion"]["to"]["blockers"]],
+                         ["active_grant"])
+        self.assertEqual(d2["deletion"]["to"]["blockers"][0]["grant_id"], "g2")
+
+        # p3 在 from 侧尚未登记 -> absent / added；p1 两侧均 active
+        # （unchanged），但其回执命中许可 g1 -> g2（changed）。
+        d3 = self._diff([p1, p3], g1, g2).json()
+        by_pid = {p["product_id"]: p for p in d3["products"]}
+        self.assertEqual(by_pid["p1"]["classification"], "unchanged")
+        self.assertEqual(by_pid["p1"]["receipts"][0]["classification"],
+                         "changed")
+        p3e = by_pid["p3"]
+        self.assertEqual(p3e["classification"], "added")
+        self.assertEqual(p3e["from"], {"presence": "absent"})
+        self.assertEqual(p3e["to"]["status"], "active")
+        self.assertEqual(p3e["flip_reasons"][0]["kind"], "registered")
+        self.assertEqual(p3e["receipts"][0]["classification"], "added")
+        self.assertEqual(p3e["receipts"][0]["from"], {"presence": "absent"})
+        self.assertEqual(d3["summary"]["products"]["added"], 1)
+        self.assertEqual(d3["summary"]["products"]["unchanged"], 1)
+        # 删除结论：两侧均 blocked，但命中许可身份 g1 -> g2 变化。
+        self.assertEqual(d3["deletion"]["classification"], "changed")
+        self.assertEqual(d3["deletion"]["from"]["status"], "blocked")
+        self.assertEqual(d3["deletion"]["to"]["status"], "blocked")
+
+        # ---- 后续事件不改变报告：再追加许可 / 撤销后重发同一 diff 完全一致。
+        again = self._diff([p2, p1, p1], g1, rev_seq).json()
+        self.assertEqual(again, d)
+        self._grant("g3")
+        self._revoke("g3")
+        after = self._diff([p2, p1, p1], g1, rev_seq).json()
+        self.assertEqual(after, d)
+
+        # ---- 两侧与独立只读 as_of_seq 回放口径一致。
+        prod_from = self.client.get(
+            f"/subjects/{self.subject}/products/{p1}?as_of_seq={g1}").json()
+        prod_to = self.client.get(
+            f"/subjects/{self.subject}/products/{p1}?as_of_seq={rev_seq}"
+        ).json()
+        self.assertEqual(prod_from["status"], d["products"][0]["from"]["status"])
+        self.assertEqual(prod_to["status"], d["products"][0]["to"]["status"])
+        self.assertEqual(prod_to["invalidating_events"],
+                         d["products"][0]["to"]["invalidating_events"])
+
+    # ------------------------------------------------ 校验拒绝
+    def test_diff_validation_rejections(self):
+        g1 = self._grant("g1")["seq"]
+        t1, p1 = self.k("t1"), self.k("p1")
+        self._task(t1, [{"product_id": p1,
+                         "groups": [[{"kind": "receipt", "ref": t1}]]}])
+        g2 = self._grant("g2")["seq"]
+        g3 = self._grant("g3")["seq"]
+        t2, p2 = self.k("t2"), self.k("p2")
+        self._task(t2, [{"product_id": p2,
+                         "groups": [[{"kind": "receipt", "ref": t2}]]}])
+        base = {"subject_id": self.subject, "product_ids": [p1],
+                "use_at": "2026-05-01T00:00:00Z",
+                "from_seq": g1, "to_seq": g2}
+
+        def post(body):
+            return self.client.post("/compliance-diffs", json=body)
+
+        # 空产品范围 / 空字符串产品 ID -> 422。
+        self.assertEqual(post({**base, "product_ids": []}).status_code, 422)
+        self.assertEqual(post({**base, "product_ids": [""]}).status_code, 422)
+        # from_seq >= to_seq -> 422；from_seq=0 -> 422。
+        self.assertEqual(post({**base, "from_seq": g2,
+                               "to_seq": g2}).status_code, 422)
+        self.assertEqual(post({**base, "from_seq": g3,
+                               "to_seq": g2}).status_code, 422)
+        self.assertEqual(post({**base, "from_seq": 0}).status_code, 422)
+        # 未来序号（超过当前全局最大事件序号）-> 422。
+        self.assertEqual(post({**base, "to_seq": 999_999_999}).status_code,
+                         422)
+        # 未知产品 -> 422。
+        self.assertEqual(post({**base, "product_ids": [self.k("ghost")]}
+                              ).status_code, 422)
+        # 产品在 to_seq 之后才登记（两侧快照均不存在）-> 422。
+        # p2 的 recorded_seq = g3（登记时主体最大事件序号）。
+        r = post({**base, "product_ids": [p2], "from_seq": g1, "to_seq": g2})
+        self.assertEqual(r.status_code, 422, r.text)
+        # to_seq 覆盖其登记序号后允许：from 侧 absent -> added。
+        ok = self._diff([p2], g1, g3).json()
+        self.assertEqual(ok["products"][0]["classification"], "added")
+
+    # ---------------------------------------- 跨主体事件不误纳入 / 无关事件不变
+    def test_diff_cross_subject_events_not_included(self):
+        g1 = self._grant("g1")["seq"]
+        t1, p1 = self.k("t1"), self.k("p1")
+        self._task(t1, [{"product_id": p1,
+                         "groups": [[{"kind": "receipt", "ref": t1}]]}])
+        # 另一主体在同一全局序号空间内追加许可与撤销（序号穿插）。
+        other = "diff-x-" + uuid.uuid4().hex[:8]
+        r = self.client.post("/grants", json={
+            "subject_id": other, "grant_id": "gx", "category": "email",
+            "purpose": "marketing", "recipient": "partner-a",
+            "valid_from": "2026-01-01T00:00:00Z"})
+        self.assertEqual(r.status_code, 201, r.text)
+        r = self.client.post("/revocations", json={
+            "subject_id": other, "grant_id": "gx",
+            "business_effective_at": "2026-01-15T00:00:00Z"})
+        self.assertEqual(r.status_code, 201, r.text)
+        other_rev_seq = r.json()["event"]["seq"]
+        # 本主体一条与回执四元组无关的许可（同序号空间）。
+        unrelated = self._grant("g9", recipient="partner-b",
+                                category="location")["seq"]
+
+        # 区间覆盖跨主体事件与无关事件：报告全部 unchanged，且
+        # to_basis_seq 只计本主体事件（仍为本主体许可 g1 的序号）。
+        d = self._diff([p1], g1, unrelated).json()
+        self.assertGreater(unrelated, other_rev_seq)  # 区间确实覆盖它们
+        self.assertEqual(d["to_basis_seq"], g1)
+        self.assertEqual(d["products"][0]["classification"], "unchanged")
+        self.assertEqual(d["products"][0]["receipts"][0]["classification"],
+                         "unchanged")
+        self.assertEqual(d["remediation_items"], [])
+        self.assertEqual(d["deletion"]["classification"], "unchanged")
+        self.assertEqual(d["deletion"]["flip_reasons"], [])
+        self.assertEqual(d["summary"]["products"]["unchanged"], 1)
+
+    # ------------------------------------------------ 处置提交反映与事件有界
+    def test_diff_remediation_submission_reflected_but_events_bounded(self):
+        g1 = self._grant("g1")["seq"]
+        t1, p1 = self.k("t1"), self.k("p1")
+        self._task(t1, [{"product_id": p1,
+                         "groups": [[{"kind": "receipt", "ref": t1}]]}])
+        rev_seq = self._revoke("g1")["event"]["seq"]
+        d1 = self._diff([p1], g1, rev_seq).json()
+        item = d1["remediation_items"][0]
+        self.assertEqual(item["to"]["status"], "open")
+        self.assertEqual(d1["deletion"]["to"]["status"], "blocked")
+        iid = item["item_id"]
+
+        # 提交 + 批准（不产生许可 / 撤销事件）：重发 diff 按请求快照反映
+        # 最新处置状态（文档化语义），删除结论 to 侧随之放行。
+        r = self.client.post(
+            f"/remediation/items/{iid}/submissions",
+            json={"version": 1, "cease_declaration": "已停止使用",
+                  "evidence": [{"product_id": p1, "summary": "已清除"}]},
+            headers={**RA_H, "Idempotency-Key": self.k("s1")})
+        self.assertEqual(r.status_code, 201, r.text)
+        r = self.client.post(f"/remediation/items/{iid}/reviews",
+                             json={"version": 1, "action": "approve"},
+                             headers=ADMIN_H)
+        self.assertEqual(r.status_code, 201, r.text)
+        d2 = self._diff([p1], g1, rev_seq).json()
+        self.assertEqual(d2["remediation_items"][0]["to"]["status"],
+                         "approved")
+        self.assertEqual(d2["deletion"]["to"]["status"], "planned")
+        # 事件驱动的部分（产品 / 回执重放与分类）不受处置提交影响。
+        self.assertEqual(d2["products"], d1["products"])
+
+        # 追加恢复许可（新事件，序号越界于 to_seq）：报告不再变化。
+        self._grant("g2")
+        d3 = self._diff([p1], g1, rev_seq).json()
+        self.assertEqual(d3, d2)
+
+    # ------------------------------------------------ 只读性与可重复性
+    def test_diff_is_read_only_and_repeatable(self):
+        g1 = self._grant("g1")["seq"]
+        t1, p1 = self.k("t1"), self.k("p1")
+        self._task(t1, [{"product_id": p1,
+                         "groups": [[{"kind": "receipt", "ref": t1}]]}])
+        rev_seq = self._revoke("g1")["event"]["seq"]
+
+        def table_counts():
+            assert db.pool is not None
+            with db.pool.connection() as conn:
+                row = conn.execute(
+                    """SELECT
+                         (SELECT count(*) FROM events) AS events,
+                         (SELECT count(*) FROM receipts) AS receipts,
+                         (SELECT count(*) FROM products) AS products,
+                         (SELECT count(*) FROM remediation_items) AS items,
+                         (SELECT count(*) FROM deletion_requests) AS deletions,
+                         (SELECT count(*) FROM attestations) AS attestations"""
+                ).fetchone()
+            return dict(row)
+
+        before = table_counts()
+        d1 = self._diff([p1], g1, rev_seq).json()
+        d2 = self._diff([p1], g1, rev_seq).json()
+        self.assertEqual(d1, d2)  # 可重复：同一 (from, to) 报告逐字节一致
+        self.assertEqual(table_counts(), before)  # 不写入任何业务表
+        events = self.client.get(
+            f"/subjects/{self.subject}/events").json()["events"]
+        self.assertEqual(len(events), 2)  # 只有许可与撤销两条事件
+
+    # ------------------------------------------------ 并发追加下的一致性
+    def test_diff_concurrent_appends_report_stable(self):
+        """并发追加事件（含跨主体）时，同一 (from_seq, to_seq) 的报告不变。
+
+        差异报告在单个 REPEATABLE READ 只读快照中按固定序号上界重放：
+        并发提交的许可 / 撤销（序号均大于 to_seq）对报告不可见；跨主体
+        事件也不会误纳入。全部并发读者的响应必须与基线逐字节一致。
+        """
+        g1 = self._grant("g1")["seq"]
+        t1, p1 = self.k("t1"), self.k("p1")
+        self._task(t1, [{"product_id": p1,
+                         "groups": [[{"kind": "receipt", "ref": t1}]]}])
+        rev_seq = self._revoke("g1")["event"]["seq"]
+        baseline = self._diff([p1], g1, rev_seq).json()
+
+        n_readers = 6
+        barrier = threading.Barrier(n_readers + 2)
+        diff_responses: list = []
+        append_responses: list = []
+
+        def reader(_):
+            barrier.wait()
+            diff_responses.append(self.client.post("/compliance-diffs", json={
+                "subject_id": self.subject, "product_ids": [p1],
+                "use_at": "2026-05-01T00:00:00Z",
+                "from_seq": g1, "to_seq": rev_seq}))
+
+        def appender():
+            # 同主体并发追加：恢复许可 + 再撤销（序号均 > to_seq）。
+            barrier.wait()
+            append_responses.append(self.client.post("/grants", json={
+                "subject_id": self.subject, "grant_id": "g2",
+                "category": "email", "purpose": "marketing",
+                "recipient": "partner-a",
+                "valid_from": "2026-01-01T00:00:00Z"}))
+            append_responses.append(self.client.post("/revocations", json={
+                "subject_id": self.subject, "grant_id": "g2",
+                "business_effective_at": "2026-01-15T00:00:00Z"}))
+
+        def cross_subject():
+            # 跨主体并发追加：同一全局序号空间，不得误纳入本主体报告。
+            barrier.wait()
+            other = "diff-cx-" + uuid.uuid4().hex[:8]
+            append_responses.append(self.client.post("/grants", json={
+                "subject_id": other, "grant_id": "gx", "category": "email",
+                "purpose": "marketing", "recipient": "partner-a",
+                "valid_from": "2026-01-01T00:00:00Z"}))
+
+        threads = ([threading.Thread(target=reader, args=(i,))
+                    for i in range(n_readers)]
+                   + [threading.Thread(target=appender),
+                      threading.Thread(target=cross_subject)])
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertTrue(all(r.status_code == 201 for r in append_responses),
+                        [r.status_code for r in append_responses])
+        self.assertEqual(len(diff_responses), n_readers)
+        for r in diff_responses:
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json(), baseline)  # 后续事件不改变报告
+
+        # 并发追加落库后：同一 diff 仍与基线一致；两侧与独立只读回放一致。
+        self.assertEqual(self._diff([p1], g1, rev_seq).json(), baseline)
+        prod_to = self.client.get(
+            f"/subjects/{self.subject}/products/{p1}?as_of_seq={rev_seq}"
+        ).json()
+        self.assertEqual(prod_to["status"],
+                         baseline["products"][0]["to"]["status"])
+        events = self.client.get(
+            f"/subjects/{self.subject}/events").json()["events"]
+        self.assertEqual(len(events), 4)  # g1/rev + 并发追加的 g2/rev
+
+
 if __name__ == "__main__":
     unittest.main()

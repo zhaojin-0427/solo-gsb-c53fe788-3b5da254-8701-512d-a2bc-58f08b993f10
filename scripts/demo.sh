@@ -274,5 +274,79 @@ post /attestations -H 'Idempotency-Key: u3-att-1' -d "{
   \"subject_id\":\"u3\",\"product_ids\":[\"report-1\"],
   \"use_at\":\"2026-05-01T00:00:00Z\",\"as_of_seq\":$U3_SEQ}"
 
+# ---------------------------------------------------------------- 合规差异报告
+say "20. 合规状态双时点差异报告：独立主体 u4 —— 许可 -> 任务/产物 -> 追溯撤销"
+U4_G1=$(post /grants -d '{
+  "subject_id":"u4","grant_id":"g1","category":"email","purpose":"marketing",
+  "recipient":"partner-a","valid_from":"2026-01-01T00:00:00Z"}')
+U4_G1_SEQ=$(echo "$U4_G1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["seq"])')
+post /tasks -H 'Idempotency-Key: u4-task-1' -d '{
+  "subject_id":"u4","category":"email","purpose":"marketing",
+  "recipient":"partner-a","use_at":"2026-05-01T00:00:00Z",
+  "products":[{"product_id":"report-1",
+               "groups":[[{"kind":"receipt","ref":"u4-task-1"}]]},
+              {"product_id":"report-2",
+               "groups":[[{"kind":"product","ref":"report-1"}]]}]}' >/dev/null
+U4_REV=$(post /revocations -d '{
+  "subject_id":"u4","grant_id":"g1",
+  "business_effective_at":"2026-01-15T00:00:00Z"}')
+U4_REV_SEQ=$(echo "$U4_REV" | python3 -c 'import sys,json;print(json.load(sys.stdin)["event"]["seq"])')
+
+say "20a. diff(许可, 撤销)：产品/回执 changed、处置项 added、删除结论翻转（原因可定位）"
+DIFF1=$(post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[\"report-1\",\"report-2\"],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_G1_SEQ,\"to_seq\":$U4_REV_SEQ}")
+echo "$DIFF1" | $PP
+
+say "20b. 恢复许可 + 新产品：diff(撤销, 新许可) 回摆；diff(许可, 新许可) 见 added/absent"
+U4_G2=$(post /grants -d '{
+  "subject_id":"u4","grant_id":"g2","category":"email","purpose":"marketing",
+  "recipient":"partner-a","valid_from":"2026-01-01T00:00:00Z"}')
+U4_G2_SEQ=$(echo "$U4_G2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["seq"])')
+post /tasks -H 'Idempotency-Key: u4-task-2' -d '{
+  "subject_id":"u4","category":"email","purpose":"marketing",
+  "recipient":"partner-a","use_at":"2026-05-01T00:00:00Z",
+  "products":[{"product_id":"report-3",
+               "groups":[[{"kind":"receipt","ref":"u4-task-2"}]]}]}' >/dev/null
+post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[\"report-1\"],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_REV_SEQ,\"to_seq\":$U4_G2_SEQ}" | $PP
+post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[\"report-1\",\"report-3\"],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_G1_SEQ,\"to_seq\":$U4_G2_SEQ}" | $PP
+
+say "20c. 后续事件不改变报告：重发 20a 的 diff，逐字节一致"
+DIFF1_AGAIN=$(post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[\"report-1\",\"report-2\"],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_G1_SEQ,\"to_seq\":$U4_REV_SEQ}")
+DIFF1="$DIFF1" DIFF1_AGAIN="$DIFF1_AGAIN" python3 - <<'PY'
+import json, os
+a = json.loads(os.environ["DIFF1"])
+b = json.loads(os.environ["DIFF1_AGAIN"])
+assert a == b, "同一 (from_seq, to_seq) 的报告在后续事件后必须一致"
+print("OK: 后续事件不改变报告（逐字节一致）")
+PY
+
+say "20d. 校验：from_seq >= to_seq / 未来序号 / 未知产品 / 空范围 均 422"
+post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[\"report-1\"],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_REV_SEQ,\"to_seq\":$U4_REV_SEQ}"
+post /compliance-diffs -d '{
+  "subject_id":"u4","product_ids":["report-1"],
+  "use_at":"2026-05-01T00:00:00Z","from_seq":1,"to_seq":999999999}'
+post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[\"ghost\"],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_G1_SEQ,\"to_seq\":$U4_REV_SEQ}"
+post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_G1_SEQ,\"to_seq\":$U4_REV_SEQ}"
+
 say "完成。事件登记处（append-only，只增不改）："
 get /subjects/u1/events | $PP
