@@ -274,5 +274,48 @@ post /attestations -H 'Idempotency-Key: u3-att-1' -d "{
   \"subject_id\":\"u3\",\"product_ids\":[\"report-1\"],
   \"use_at\":\"2026-05-01T00:00:00Z\",\"as_of_seq\":$U3_SEQ}"
 
+say "20. 合规状态双时点差异报告（只读、不落库）：独立主体 u4"
+# 许可 g1 -> 任务/产物链 p1<-p2 -> 追溯撤销（开立处置项）-> 新许可恢复。
+post /grants -d '{
+  "subject_id":"u4","grant_id":"g1","category":"email","purpose":"marketing",
+  "recipient":"partner-a","valid_from":"2026-01-01T00:00:00Z"}' >/dev/null
+U4_G=$(get /subjects/u4/events | python3 -c 'import sys,json;print(json.load(sys.stdin)["events"][0]["seq"])')
+post /tasks -H 'Idempotency-Key: u4-task-1' -d '{
+  "subject_id":"u4","category":"email","purpose":"marketing",
+  "recipient":"partner-a","use_at":"2026-05-01T00:00:00Z",
+  "products":[{"product_id":"report-1",
+               "groups":[[{"kind":"receipt","ref":"u4-task-1"}]]},
+              {"product_id":"report-2",
+               "groups":[[{"kind":"product","ref":"report-1"}]]}]}' >/dev/null
+U4_REV=$(post /revocations -d '{
+  "subject_id":"u4","grant_id":"g1",
+  "business_effective_at":"2026-01-15T00:00:00Z"}')
+U4_REV_SEQ=$(echo "$U4_REV" | python3 -c 'import sys,json;print(json.load(sys.stdin)["event"]["seq"])')
+post /grants -d '{
+  "subject_id":"u4","grant_id":"g2","category":"email","purpose":"marketing",
+  "recipient":"partner-a","valid_from":"2026-01-01T00:00:00Z"}' >/dev/null
+U4_END=$(get /subjects/u4/events | python3 -c 'import sys,json;print(json.load(sys.stdin)["events"][-1]["seq"])')
+
+say "20a. from=许可上界 -> to=撤销上界：产品/回执 changed，处置项 added（可定位撤销序号）"
+post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[\"report-1\",\"report-2\"],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_G,\"to_seq\":$U4_REV_SEQ}" | $PP
+
+say "20b. from=撤销上界 -> to=恢复许可上界：回执恢复（grant_restored）、处置项取消（item_cancelled）"
+post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[\"report-1\",\"report-2\"],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_REV_SEQ,\"to_seq\":$U4_END}" | $PP
+
+say "20c. 校验：from_seq>=to_seq / 未来序号 / 未知产品 / 空范围 均 422"
+post /compliance-diffs -d "{
+  \"subject_id\":\"u4\",\"product_ids\":[\"report-1\"],
+  \"use_at\":\"2026-05-01T00:00:00Z\",
+  \"from_seq\":$U4_END,\"to_seq\":$U4_END}"; echo
+post /compliance-diffs -d '{
+  "subject_id":"u4","product_ids":["report-1"],
+  "use_at":"2026-05-01T00:00:00Z","from_seq":1,"to_seq":999999999}'; echo
+
 say "完成。事件登记处（append-only，只增不改）："
 get /subjects/u1/events | $PP

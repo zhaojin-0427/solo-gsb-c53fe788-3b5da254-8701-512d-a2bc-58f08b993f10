@@ -127,6 +127,35 @@ class AttestationCreate(BaseModel):
         return v
 
 
+# ------------------------------------------------------------- 合规状态双时点差异
+class ComplianceDiffCreate(BaseModel):
+    subject_id: str = Field(..., min_length=1, description="数据主体")
+    product_ids: list[str] = Field(
+        ..., description="产品范围；必须非空，且均为 to_seq 快照中已登记的主体产物")
+    use_at: datetime = Field(..., description="重放锚定的业务使用时点")
+    from_seq: int = Field(
+        ..., ge=1, description="旧侧全局事件序号上界（from_seq < to_seq）")
+    to_seq: int = Field(
+        ..., ge=1, description="新侧全局事件序号上界（必须为已存在的事件序号）")
+
+    @field_validator("product_ids")
+    @classmethod
+    def _non_empty_products(cls, v):
+        if not v:
+            raise ValueError("产品范围不能为空")
+        if any(not pid or not isinstance(pid, str) for pid in v):
+            raise ValueError("产品 ID 不能为空")
+        return v
+
+    @field_validator("to_seq")
+    @classmethod
+    def _ordered_seqs(cls, v, info):
+        from_seq = info.data.get("from_seq")
+        if from_seq is not None and not from_seq < v:
+            raise ValueError("要求 from_seq < to_seq")
+        return v
+
+
 class AttestationVerifyRequest(BaseModel):
     """独立验签请求：声明字节 + 摘要 + 签名（可选 alg，默认 HMAC-SHA256）。
 

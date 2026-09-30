@@ -27,7 +27,8 @@ from . import attestation as attestation_mod
 from .db import init_pool, shutdown_pool, transaction
 from .errors import ApiError, forbidden, unauthorized, unprocessable
 from .schemas import (AttestationCreate, AttestationVerifyRequest,
-                      DeletionRequestCreate, EvaluateRequest, GrantRequest,
+                      ComplianceDiffCreate, DeletionRequestCreate,
+                      EvaluateRequest, GrantRequest,
                       RemediationReviewRequest, RemediationSubmissionRequest,
                       RevokeRequest, TaskRequest)
 from .service import Service
@@ -54,7 +55,10 @@ app = FastAPI(
         "撤销同事务开立处置台账，接收方按版本提交停止使用声明与清除证据，"
         "管理员复核结案；幂等登记删除请求并生成下游先删删除计划；"
         "合规证明在同一快照内重放全部依据，规范化声明附 SHA-256 摘要与"
-        "本地密钥 HMAC-SHA256 签名，可独立验签，后续事件不改写既有证明。"
+        "本地密钥 HMAC-SHA256 签名，可独立验签，后续事件不改写既有证明；"
+        "合规状态双时点差异报告在一个 REPEATABLE READ 只读快照内按两条"
+        "全局事件序号上界分别重放，给出 added/removed/changed/unchanged "
+        "分类、两侧稳定依据与状态翻转原因，只读不落库，后续事件不改变报告。"
     ),
 )
 
@@ -293,6 +297,22 @@ def get_deletion_request(request_id: int):
     """
     with transaction(read_only=True) as conn:
         return Service(conn).get_deletion_request(request_id)
+
+
+# ---------------------------------------------------------------- 合规状态双时点差异
+@app.post("/compliance-diffs", tags=["compliance-diffs"])
+def create_compliance_diff(req: ComplianceDiffCreate):
+    """合规状态双时点差异报告（只读，200；不写入任何业务表）。
+
+    在**一个 REPEATABLE READ 只读快照**中分别按 ``from_seq`` 与
+    ``to_seq`` 两条全局事件上界重放许可、撤销、决策回执、血缘产品、
+    处置项与删除结论，返回每个产品及其传递回执的
+    added/removed/changed/unchanged 分类、两侧稳定依据与状态翻转原因；
+    from 侧尚未登记的产品标为 absent；未知 / 未来序号拒绝。结果按产品、
+    回执与事件序号稳定排序；后续事件不改变锚定序号的报告。
+    """
+    with transaction(read_only=True) as conn:
+        return Service(conn).create_compliance_diff(req)
 
 
 # ---------------------------------------------------------------- 合规证明

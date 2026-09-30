@@ -35,6 +35,15 @@
   证明**，`POST /attestations/verify` 验签只依赖声明、摘要、签名与配置
   密钥，**不读取任何可变业务状态**。产品范围为空、含未知产品或越界
   `as_of_seq` 一律拒绝。
+- **合规状态双时点差异报告**：客户端 `POST /compliance-diffs` 提交
+  `subject_id`、非空 `product_ids`、`use_at` 与两条全局事件序号上界
+  `from_seq < to_seq`，服务在**一个 REPEATABLE READ 只读快照**中分别
+  按两条上界重放许可、撤销、决策回执、血缘产品、处置项与删除结论，
+  返回每个产品及其传递回执的 **added / removed / changed / unchanged**
+  分类、两侧稳定依据与状态翻转原因；`from` 侧尚未登记的产品标为
+  **absent**，未知产品、未来或非法序号一律拒绝。结果按产品、回执与
+  事件序号稳定排序，**不写入任何业务表**，后续事件不改变锚定序号的
+  报告（只读、无幂等键、恒为 200）。
 
 ## 1. 一键启动
 
@@ -102,13 +111,16 @@ compose 为**撤销处置台账**预置了本地开发令牌（可通过环境�
 | POST | `/attestations` | **幂等**生成合规证明：同一快照重放全部依据，规范化声明 + SHA-256 摘要 + HMAC 签名（需 `Idempotency-Key`） |
 | GET  | `/attestations/{id}` | 取回既有证明的声明字节、摘要与签名（不按当前状态重放） |
 | POST | `/attestations/verify` | 独立验签：只依赖声明、摘要、签名与配置密钥，不读取业务状态 |
+| POST | `/compliance-diffs` | **只读**双时点差异报告：一个 REPEATABLE READ 快照中按 `from_seq`/`to_seq` 两上界重放，分类 + 两侧稳定依据 + 翻转原因（不写业务表，200） |
 
 错误统一返回 `{"error": {"code", "message"}}`，状态码：
 `401 unauthorized`（缺少 / 无效令牌）、`403 forbidden`（令牌角色或接收方不匹配）、
 `404 not_found` / `409 conflict`（幂等键冲突、grant_id/product_id 重复、
 处置项版本过期 / 已结案）/
 `422 unprocessable_entity`（血缘有环、引用未知、半开区间非法、证据未覆盖关联产物、
-证明产品范围为空 / 含未知产品 / 越界 as_of_seq、验签输入格式非法等）。
+证明产品范围为空 / 含未知产品 / 越界 as_of_seq、双时点差异产品范围为空 /
+含未知产品 / 产品在 to_seq 之后才登记 / from_seq、to_seq 非法或为未来序号、
+验签输入格式非法等）。
 
 ## 4. 示例调用
 
@@ -439,6 +451,108 @@ signature_ok = hmac.compare_digest(
 本地默认值，**生产部署务必覆盖**）。密钥是本地对称密钥：服务重启不变
 （声明仍可验签）；轮换密钥后旧签名只能用旧密钥验证。
 
+### 4.9 合规状态双时点差异报告（只读、不落库）
+
+客户端提交主体、**非空**产品范围、`use_at` 与两条全局事件序号上界
+（`from_seq < to_seq`）：
+
+```bash
+curl -sS -X POST localhost:8000/compliance-diffs \
+  -H 'Content-Type: application/json' -d '{
+    "subject_id":"u3",
+    "product_ids":["report-1","report-2"],
+    "use_at":"2026-05-01T00:00:00Z",
+    "from_seq":2,
+    "to_seq":5}'
+```
+
+服务在**一个 REPEATABLE READ 只读事务**（不获取主体写锁、不写任何
+业务表，恒返回 200）中，对同一份快照数据分别按两条全局事件上界各做
+一次可见性过滤与重放：许可 / 撤销（`seq <= 上界`，按各回执自身的
+`use_at` 双时点重放）、决策回执（`recorded_seq <= 上界`）、血缘产品
+（`recorded_seq <= 上界` 的 DAG 传播）、处置项（开立撤销序号
+`<= 上界`；取消记录按其许可序号过滤）与删除结论（快照血缘下游闭包 +
+阻断派生）。
+
+响应（节选）为每个产品给出分类、两侧稳定依据与翻转原因：
+
+```json
+{"subject_id":"u3","use_at":"2026-05-01T00:00:00+00:00",
+ "from_seq":2,"to_seq":5,"basis_seq_from":2,"basis_seq_to":5,
+ "products":[{"product_id":"report-1","recorded_seq":2,
+   "classification":"changed",
+   "status_flip_reasons":[{"code":"lineage_receipts_invalidated",
+     "message":"血缘传递回执在 to 侧重放中失效，产品由 active 转为 blocked",
+     "receipt_keys":["u3-task-1"]},
+    {"code":"invalidating_events_added","event_seqs":[5]}],
+   "from":{"status":"active","invalidating_events":[], "explanation":[...]},
+   "to":{"status":"blocked","invalidating_events":[5],"explanation":[...]},
+   "receipts":[{"receipt_key":"u3-task-1","product_id":"report-1",
+     "classification":"changed",
+     "status_flip_reasons":[{"code":"revocation_took_effect",
+       "revocation_seq":5,"grant_id":"g1"}],
+     "from":{"currently_valid":true,"basis_kind":"grant","basis_seq":2,...},
+     "to":{"currently_valid":false,"basis_kind":"revocation","basis_seq":5,
+           "invalidating_events":[5],...}}],
+   "remediation_items":[{"item_id":3,"receipt_key":"u3-task-1",
+     "recipient":"partner-a","classification":"added",
+     "status_flip_reasons":[{"code":"item_opened","revocation_seq":5}],
+     "from":null,
+     "to":{"status":"open","revocation_seq":5,
+           "cancelled_by_grant_seq":null}}]}],
+ "deletion":{"from_scope":["report-1","report-2"],"to_scope":[...],
+   "status_from":"blocked","status_to":"blocked","classification":"changed",
+   "blockers":[{"identity":["active_grant","u3-task-1","g1",2],
+                "classification":"removed","from":{...},"to":null},
+               {"identity":["open_remediation",3],
+                "classification":"added","from":null,"to":{...}}],
+   "from":{...},"to":{...}}}
+```
+
+**分类语义**（产品与其传递回执统一使用）：
+
+| 分类 | 含义 |
+| --- | --- |
+| `added` | 实体只在 to 侧存在：回执 / 处置项 / 删除阻断原因在两上界之间进入视野 |
+| `removed` | 实体只在 from 侧存在（只追加模型中产品 / 回执不消失；用于处置项、阻断原因消失） |
+| `changed` | 两侧都存在但稳定依据不同（状态翻转、命中许可 / 撤销切换、失效事件集合变化） |
+| `unchanged` | 两侧都存在且稳定依据一致 |
+| `absent` | **产品在 `from_seq` 之后、`to_seq` 之前登记**：产品级 `from` 为 null；其传递回执在 from 侧同样缺席，逐条以 `absent` 返回 |
+
+**状态翻转原因（可定位）**只引用稳定标识与事件序号，例如：
+
+- 回执：`revocation_took_effect`（追溯撤销命中，给 `revocation_seq` /
+  `grant_id`）、`grant_restored`（新许可恢复，给 `grant_seq`）、
+  `basis_switched`（命中许可 / 撤销切换，给两侧依据）、
+  `invalidating_events_added/removed`（给事件序号集合）、`entered_scope`；
+- 产品：`product_recorded_between`（absent）、
+  `lineage_receipts_invalidated/restored`（给沿血缘翻转的回执键）、
+  失效事件集合增删；
+- 处置项：`item_opened`（给撤销序号）、`item_cancelled`（给取消许可
+  序号）、`remediation_status_changed`（台账状态流转）；
+- 删除结论：`deletion_status_flipped`（planned ↔ blocked）、
+  `blocker_set_changed`；阻断原因按稳定身份
+  （`active_grant` = 回执键 + 命中许可，`open_remediation` = 处置项 ID）
+  逐条 added / removed / unchanged，并给两侧完整依据与批次。
+
+**校验**：产品范围为空、含主体未知产品、产品在 `to_seq` 之后才登记、
+`from_seq >= to_seq`、`from_seq` 或 `to_seq` 超过当前全局最大事件序号
+（未来序号）均 `422`。注意产品在 `to_seq` 已存在但 `from_seq` 时尚未
+登记是**合法**的，报告标 `absent`；只有 `to_seq` 快照中都不存在才拒绝。
+
+**稳定性与快照语义**：
+
+- 报告在**单个 REPEATABLE READ 只读快照**中派生两侧视图，结果只含由
+  两条序号上界派生的稳定依据（无服务端时间、无 `current_seq`），同
+  参数重复调用逐字段一致；
+- **后续许可 / 撤销事件不改变报告**（上界过滤），其他主体的事件即使
+  全局序号落在两上界之间也**绝不误纳入**（回执重放按主体过滤，
+  `basis_seq_from/to` 是该主体自身可见的最大事件序号）；
+- 处置项开立 / 取消均由许可 / 撤销事件驱动（带序号），同样按上界
+  过滤——后续恢复许可的取消不会回溯改变更早上界的报告；接收方提交
+  与管理员复核**不产生事件序号**，其台账派生状态口径与合规证明一致
+  （同一未结处置项在 open/submitted/rejected 间流转属同一阻断身份）。
+
 ### 一键跑完整演示
 
 ```bash
@@ -471,8 +585,12 @@ BASE_URL=http://localhost:8000 ./scripts/demo.sh
     - **任务先获锁登记**：撤销响应的 `affected_receipts` **恰好**列出其获得
       主体锁之前已登记且被本次撤销失效的回执，不多不少；产物的阻断状态与
       `as_of_seq` 历史回放保持一致。
-- 只读端点（决策重放、事件列表、回执 / 产物查询）使用
-  `REPEATABLE READ ... READ ONLY` 事务，看到一致快照且 PostgreSQL 拒绝任何写操作。
+- 只读端点（决策重放、事件列表、回执 / 产物查询、合规状态双时点差异）
+  使用 `REPEATABLE READ ... READ ONLY` 事务，看到一致快照且 PostgreSQL
+  拒绝任何写操作。双时点差异在**同一个只读事务**内派生两侧视图：
+  先一次性加载快照原始数据（事件 / 回执 / 血缘 / 台账），再分别按
+  `from_seq` / `to_seq` 过滤重放，两侧天然落在同一快照；并发追加事件
+  时报告只取决于已提交事件集合与序号上界，绝不读到半提交状态。
 - 事务属性通过 psycopg3 的**连接属性**设置：在事务开始前设置
   `conn.isolation_level` / `conn.read_only`，由 `conn.transaction()` 发出
   `BEGIN ISOLATION LEVEL REPEATABLE READ [READ ONLY|READ WRITE]`。
@@ -518,7 +636,8 @@ BASE_URL=http://localhost:8000 ./scripts/demo.sh
 
 纯领域逻辑（确定性重放、半开区间、替代依据组、血缘传播、解释排序、无环检测、
 血缘传递依赖、处置项 / 案件状态机、删除范围下游闭包、删除批次分层、
-历史 / 当前结论比较（过期判定）、合规证明规范序列化 / 摘要 / HMAC 验签）
+历史 / 当前结论比较（过期判定）、合规证明规范序列化 / 摘要 / HMAC 验签、
+双时点差异分类 / 稳定签名 / 翻转原因）
 不依赖第三方库，可直接运行：
 
 ```bash
@@ -574,6 +693,17 @@ DATABASE_URL=postgresql://consent:consent@localhost:5432/consent \
   （多证明与撤销并发：同 `as_of_seq` 证明逐字节一致且与独立只读回放口径
   相同，撤销后证明不同而历史证明不改写）；**篡改持久层字节**后验签如实
   失败且验签不读库（未篡改字节 + 原签名仍通过）。
+- **合规状态双时点差异**端到端：撤销使产品 / 传递回执 changed 并定位到
+  撤销事件序号、处置项 added（`item_opened`）；新许可恢复时回执
+  `grant_restored`、处置项 `item_cancelled`（可定位取消许可序号）；
+  `from_seq` 后登记的产品 / 回执标 `absent`（from 依据为 null）；
+  两上界间仅有其他主体事件时产品 / 回执 / 删除结论 unchanged 且依据中
+  不出现跨主体序号；空范围 / 未知产品 / `from>=to` / 未来序号 / 产品
+  在 `to_seq` 后才登记的 422 拒绝；报告**只读**（前后业务表行数不变）、
+  同参数稳定且**后续许可 / 撤销事件不改写锚定报告**；**并发追加事件下
+  两侧快照一致**（多份同参数报告与一笔撤销在主体锁上并发：报告逐字节
+  一致，to 侧口径与独立只读 `?as_of_seq=` 回放相同，撤销后新上界报告
+  翻转、旧上界报告不变）。
 
 ## 7. 目录结构
 
@@ -583,8 +713,9 @@ app/
   db.py           psycopg3 连接池、事务上下文（隔离级别/只读/主体咨询锁）与启动建表
   domain.py       纯领域逻辑：双时点重放 + 血缘阻断 + 处置项状态机 + 删除批次/结论比较（可单测）
   attestation.py  合规证明：规范 JSON 序列化、SHA-256 摘要、HMAC-SHA256 签名与独立验签（可单测）
+  compliance_diff.py 双时点差异：added/removed/changed/unchanged 分类、稳定签名与状态翻转原因（可单测）
   repository.py   只追加 SQL 访问层（事件 / 回执 / 产物 / 处置台账 / 删除请求 / 合规证明）
-  service.py      事件追加 / 确定性重放 / 幂等登记 / 撤销传播 / 处置台账 / 删除计划 / 证明编排
+  service.py      事件追加 / 确定性重放 / 幂等登记 / 撤销传播 / 处置台账 / 删除计划 / 证明 / 双时点差异编排
   schemas.py      Pydantic 请求模型
   main.py         FastAPI 路由与 Bearer 令牌鉴权
 sql/schema.sql    追加式表结构（含处置项、证据、复核决定、取消记录、删除请求与计划、合规证明）

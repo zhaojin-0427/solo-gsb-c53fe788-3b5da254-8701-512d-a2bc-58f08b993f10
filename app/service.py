@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import attestation as attestation_mod
+from . import compliance_diff as cdiff
+from . import config
 from . import domain
 from .errors import conflict, forbidden, not_found, unprocessable
 from .repository import Repo, event_from_row
@@ -1104,6 +1106,368 @@ class Service:
         if replayed is not None:
             result["idempotent_replay"] = replayed
         return result
+
+
+    # ============================================================== 合规状态双时点差异
+    def create_compliance_diff(self, req) -> dict:
+        """合规状态双时点差异报告（只读；不写入任何业务表）。
+
+        在路由开启的**单个 REPEATABLE READ 只读事务**内，分别以两条全局
+        事件序号上界（``from_seq`` / ``to_seq``）各做一次快照重放，重放
+        许可、撤销、决策回执、血缘产品、处置项与删除结论，并比较两侧
+        派生状态：
+
+        * ``from_seq`` / ``to_seq`` 必须为已存在的全局事件序号（未来序号
+          拒绝），且 ``from_seq < to_seq``（Pydantic 层已校验）；
+        * 产品范围非空、全部为主体已登记产物，且在 ``to_seq`` 快照中已
+          存在（``recorded_seq <= to_seq``）；在 ``from_seq`` 之后才登记
+          的产品标为 ``absent``，其传递回执在 from 侧同样缺席；
+        * 报告结果只由序号上界与同一事务快照派生，后续事件 / 台账追加
+          只要不改变所锚定序号的重放就不改变报告（事件上界过滤保证）。
+        """
+        requested = sorted(set(req.product_ids))
+        use_at = utc(req.use_at)
+
+        # 未知 / 未来序号拒绝：序号是全局单调序号（与合规证明同口径）。
+        max_seq = self.repo.max_event_seq()
+        if req.from_seq > max_seq:
+            raise unprocessable(
+                f"from_seq 越界：当前最大事件序号为 {max_seq}")
+        if req.to_seq > max_seq:
+            raise unprocessable(
+                f"to_seq 越界：当前最大事件序号为 {max_seq}")
+
+        all_products, _, products_rows, _, _ = self._load_product_graph(
+            req.subject_id)
+        unknown = [pid for pid in requested if pid not in all_products]
+        if unknown:
+            raise unprocessable("未知产物: " + ", ".join(unknown))
+        recorded_seq_by_pid = {p["product_id"]: p["recorded_seq"]
+                               for p in products_rows}
+        future = [pid for pid in requested
+                  if recorded_seq_by_pid[pid] > req.to_seq]
+        if future:
+            raise unprocessable(
+                "to_seq 早于以下产物的登记序号（to 侧快照中尚不存在）: "
+                + ", ".join(sorted(future)))
+
+        # 同一事务内一次性加载快照原始数据（事件 / 回执 / 血缘 / 台账），
+        # 两个上界视图只是对同一份数据做不同的可见性过滤与重放，保证
+        # “一个 REPEATABLE READ 快照中分别重放”。
+        events = self._subject_events(req.subject_id)
+        receipt_rows = {
+            r["idempotency_key"]: r
+            for r in self.repo.get_receipts_for_subject(req.subject_id)}
+        remediation_entries = self._remediation_state(req.subject_id)
+
+        def horizon(seq: int) -> dict:
+            return self._diff_horizon(
+                req.subject_id, seq, all_products,
+                recorded_seq_by_pid, events, receipt_rows,
+                remediation_entries)
+
+        from_view = horizon(req.from_seq)
+        to_view = horizon(req.to_seq)
+        return self._build_diff_report(
+            subject_id=req.subject_id, use_at=use_at.isoformat(),
+            from_seq=req.from_seq, to_seq=req.to_seq,
+            requested=requested,
+            from_view=from_view, to_view=to_view)
+
+    def _diff_horizon(self, subject_id: str, seq: int,
+                      all_products: dict, recorded_seq_by_pid: dict,
+                      events: list[domain.Event],
+                      receipt_rows: dict,
+                      remediation_entries: dict) -> dict:
+        """按一条全局事件上界在当前快照数据上派生完整重放视图。"""
+        visible_events = [e for e in events if e.seq <= seq]
+        basis_seq = max((e.seq for e in visible_events), default=0)
+
+        # 回执：仅快照时点（recorded_seq <= seq）已登记；按各回执自身的
+        # use_at 双时点重放（与产物状态 / 删除阻断重放口径一致）。
+        receipt_views: dict[str, dict] = {}
+        receipt_rows_visible: list[dict] = []
+        for key, row in receipt_rows.items():
+            if row["recorded_seq"] <= seq:
+                receipt_views[key] = self._receipt_horizon_view(
+                    row, events, seq)
+                receipt_rows_visible.append(row)
+
+        # 血缘：仅快照时点已登记的产物。
+        horizon_pids = {pid for pid in all_products
+                        if recorded_seq_by_pid[pid] <= seq}
+        products = {pid: groups for pid, groups in all_products.items()
+                    if pid in horizon_pids}
+        receipt_states = {
+            key: domain.ReceiptState(
+                key, view["currently_valid"],
+                tuple(sorted(view["invalidating_events"])), view["reason"])
+            for key, view in receipt_views.items()}
+        evaluations = domain.evaluate_product_graph(products, receipt_states)
+        product_views = {
+            pid: {"product_id": pid,
+                  "recorded_seq": recorded_seq_by_pid[pid],
+                  "status": "active" if node.active else "blocked",
+                  "invalidating_events": list(node.invalidating_seqs),
+                  "explanation": node.explanation_groups}
+            for pid, node in evaluations.items()}
+
+        # 处置项：开立撤销序号 <= seq 才在快照中可见；取消记录由许可事件
+        # 驱动（带 grant_seq），同样按上界过滤——后续恢复许可的取消不得
+        # 回溯改变锚定更早上界的报告（“后续事件不改变报告”）。提交 /
+        # 复核不产生事件序号，其台账派生状态口径与合规证明一致。
+        item_views = {}
+        visible_entries = []
+        for entry in remediation_entries.values():
+            if entry["item"]["revocation_seq"] <= seq:
+                item = entry["item"]
+                cancel_row = entry["cancellation"]
+                cancelled_now = (cancel_row is not None
+                                 and cancel_row["grant_seq"] <= seq)
+                if cancelled_now:
+                    status = "cancelled"
+                    cancel_seq = cancel_row["grant_seq"]
+                else:
+                    # 不采用含“未来取消”的 entry["status"]，按提交 / 复核
+                    # 追加记录重新派生（取消在该上界尚不成立）。
+                    status = domain.remediation_item_status(
+                        cancelled=False,
+                        submission_versions=[s["version"]
+                                             for s in entry["submissions"]],
+                        reviews={v: r["action"]
+                                 for v, r in entry["reviews"].items()})
+                    cancel_seq = None
+                horizon_entry = {**entry, "status": status}
+                visible_entries.append(horizon_entry)
+                item_views[item["item_id"]] = {
+                    "item_id": item["item_id"],
+                    "receipt_key": item["receipt_key"],
+                    "recipient": item["recipient"],
+                    "revocation_seq": item["revocation_seq"],
+                    "status": status,
+                    "cancelled_by_grant_seq": cancel_seq}
+
+        # 删除结论：快照血缘做下游闭包，复用删除请求的阻断派生。
+        return {"seq": seq, "basis_seq": basis_seq,
+                "events": visible_events, "products_graph": products,
+                "product_views": product_views,
+                "receipt_views": receipt_views,
+                "receipt_rows": receipt_rows_visible,
+                "item_views": item_views,
+                "remediation_entries": visible_entries}
+
+    def _receipt_horizon_view(self, row: dict,
+                              events: list[domain.Event],
+                              seq: int) -> dict:
+        """单条回执在某事件上界下的稳定依据视图。"""
+        if row["decision"] == "deny":
+            return {"receipt_key": row["idempotency_key"],
+                    "recorded_seq": row["recorded_seq"],
+                    "decision": "deny",
+                    "currently_valid": False,
+                    "invalidating_events": [],
+                    "basis_kind": "none",
+                    "basis_seq": None,
+                    "grant_id": None,
+                    "reason": row["basis_reason"]}
+        dec = domain.decide(
+            events,
+            subject_id=row["subject_id"], category=row["category"],
+            purpose=row["purpose"], recipient=row["recipient"],
+            use_at=utc(row["use_at"]).isoformat(), as_of_seq=seq)
+        if dec.outcome == "allow":
+            basis_kind, basis_seq, grant_id, invalid, reason = (
+                "grant", dec.grant.seq, dec.grant.grant_id, [], "grant")
+        elif dec.reason == "revoked":
+            basis_kind, basis_seq, grant_id, invalid, reason = (
+                "revocation", dec.revocation.seq, dec.grant.grant_id,
+                [dec.revocation.seq], "revoked")
+        else:  # 登记为 allow 的回执在更早上界重放理论上不会变 no_grant。
+            basis_kind, basis_seq, grant_id, invalid, reason = (
+                "none", None, None, [], "no_grant")
+        return {"receipt_key": row["idempotency_key"],
+                "recorded_seq": row["recorded_seq"],
+                "decision": row["decision"],
+                "currently_valid": dec.outcome == "allow",
+                "invalidating_events": invalid,
+                "basis_kind": basis_kind,
+                "basis_seq": basis_seq,
+                "grant_id": grant_id,
+                "reason": reason}
+
+    def _build_diff_report(self, *, subject_id: str, use_at: str,
+                           from_seq: int, to_seq: int,
+                           requested: list[str],
+                           from_view: dict, to_view: dict) -> dict:
+        """比较两个上界视图，组装稳定排序的差异报告。
+
+        报告只含由两条序号上界与该事务快照派生的稳定依据：不含
+        ``current_seq`` 等“当前”可变值，故后续事件追加永不改变锚定
+        序号的报告。
+        """
+        products_out = []
+        for pid in requested:
+            products_out.append(self._diff_product(
+                pid, from_view, to_view))
+
+        deletion = self._diff_deletion(requested, from_view, to_view)
+        return {
+            "subject_id": subject_id,
+            "use_at": use_at,
+            "from_seq": from_seq,
+            "to_seq": to_seq,
+            "basis_seq_from": from_view["basis_seq"],
+            "basis_seq_to": to_view["basis_seq"],
+            "products": products_out,
+            "deletion": deletion}
+
+    def _diff_product(self, pid: str, fv_all: dict,
+                      tv_all: dict) -> dict:
+        """单个产品的产品级 / 传递回执 / 关联处置项差异。"""
+        fp = fv_all["product_views"].get(pid)
+        tp = tv_all["product_views"].get(pid)
+
+        # from 侧尚未登记（recorded_seq > from_seq 且 <= to_seq）：absent。
+        if fp is None and tp is not None:
+            classification = cdiff.DIFF_ABSENT
+            # from 侧血缘闭包不存在：该产品的传递回执在 from 侧全部缺席。
+            from_keys: set[str] = set()
+        else:
+            classification = cdiff.classify_entity(
+                fp, tp, cdiff.product_signature)
+            from_graph = fv_all["products_graph"]
+            from_keys = (domain.transitive_receipts(from_graph, pid)
+                         if pid in from_graph else set())
+        to_graph = tv_all["products_graph"]
+        to_keys = (domain.transitive_receipts(to_graph, pid)
+                   if pid in to_graph else set())
+
+        receipts_out = self._diff_product_receipts(
+            sorted(from_keys | to_keys), pid, fv_all, tv_all,
+            from_keys, to_keys)
+        receipt_reasons = cdiff.product_flip_reasons(fp, tp, receipts_out)
+        items_out = self._diff_product_items(
+            sorted(from_keys | to_keys), fv_all, tv_all)
+
+        return {
+            "product_id": pid,
+            "recorded_seq": (tp or fp)["recorded_seq"],
+            "classification": classification,
+            "status_flip_reasons": receipt_reasons,
+            "from": (None if fp is None else self._product_side(fp)),
+            "to": (None if tp is None else self._product_side(tp)),
+            "receipts": receipts_out,
+            "remediation_items": items_out}
+
+    @staticmethod
+    def _product_side(view: dict) -> dict:
+        return {"status": view["status"],
+                "invalidating_events": list(view["invalidating_events"]),
+                "explanation": view["explanation"]}
+
+    def _diff_product_receipts(self, keys: list[str], pid: str,
+                               fv_all: dict, tv_all: dict,
+                               from_keys: set[str],
+                               to_keys: set[str]) -> list[dict]:
+        """产品传递回执的两侧分类、稳定依据与翻转原因（按回执键排序）。"""
+        out = []
+        for key in keys:
+            fr = fv_all["receipt_views"].get(key) if key in from_keys else None
+            tr = tv_all["receipt_views"].get(key) if key in to_keys else None
+            if fr is None and tr is None:
+                continue
+            if fr is None:
+                classification = cdiff.DIFF_ABSENT
+                reasons = cdiff.receipt_flip_reasons(None, tr)
+            elif tr is None:
+                classification = cdiff.DIFF_REMOVED
+                reasons = cdiff.receipt_flip_reasons(fr, None)
+            else:
+                classification = cdiff.classify_entity(
+                    fr, tr, cdiff.receipt_signature)
+                reasons = cdiff.receipt_flip_reasons(fr, tr)
+            out.append({"receipt_key": key,
+                        "product_id": pid,
+                        "classification": classification,
+                        "status_flip_reasons": reasons,
+                        "from": fr, "to": tr})
+        return out
+
+    def _diff_product_items(self, receipt_keys: list[str],
+                            fv_all: dict, tv_all: dict) -> list[dict]:
+        """关联处置项（from/to 两侧开立撤销已可见者）按 item_id 排序。"""
+        f_items = {iid: v for iid, v in fv_all["item_views"].items()
+                   if v["receipt_key"] in set(receipt_keys)}
+        t_items = {iid: v for iid, v in tv_all["item_views"].items()
+                   if v["receipt_key"] in set(receipt_keys)}
+        out = []
+        for iid in sorted(set(f_items) | set(t_items)):
+            fi, ti = f_items.get(iid), t_items.get(iid)
+            classification = cdiff.classify_entity(
+                fi, ti, cdiff.remediation_item_signature)
+            out.append({
+                "item_id": iid,
+                "receipt_key": (ti or fi)["receipt_key"],
+                "recipient": (ti or fi)["recipient"],
+                "classification": classification,
+                "status_flip_reasons":
+                    cdiff.remediation_item_flip_reasons(fi, ti),
+                "from": fi, "to": ti})
+        return out
+
+    def _diff_deletion(self, requested: list[str],
+                       fv_all: dict, tv_all: dict) -> dict:
+        """两侧删除结论：范围闭包、阻断原因逐条分类与批次（按事件序号稳定）。"""
+        def side(view):
+            graph = view["products_graph"]
+            seeds = [pid for pid in requested if pid in graph]
+            scope = sorted(domain.downstream_closure(graph, seeds))
+            blockers = self._blockers_from(
+                scope, view["events"], products=graph,
+                receipt_rows=view["receipt_rows"],
+                remediation_entries=view["remediation_entries"])
+            blockers = sorted(blockers, key=cdiff.blocker_identity)
+            status = "blocked" if blockers else "planned"
+            batches = ([] if blockers else
+                       [{"batch_no": no, "product_ids": pids}
+                        for no, pids in enumerate(
+                            domain.deletion_batches(graph, scope), start=1)])
+            return {"scope": scope, "status": status,
+                    "blockers": blockers, "batches": batches}
+
+        fs, ts = side(fv_all), side(tv_all)
+        blocker_diffs = cdiff.diff_blockers(fs["blockers"], ts["blockers"])
+        status_changed = cdiff.deletion_status_changed(
+            fs["status"], ts["status"])
+        if status_changed:
+            reasons = [{"code": "deletion_status_flipped",
+                        "message": "删除结论在两条上界之间翻转",
+                        "from_status": fs["status"],
+                        "to_status": ts["status"]}]
+        elif any(d["classification"] != cdiff.DIFF_UNCHANGED
+                 for d in blocker_diffs):
+            reasons = [{"code": "blocker_set_changed",
+                        "message": "阻断原因身份集合发生增删"}]
+        else:
+            reasons = []
+        return {
+            "from_scope": fs["scope"],
+            "to_scope": ts["scope"],
+            "status_from": fs["status"],
+            "status_to": ts["status"],
+            "classification": (cdiff.DIFF_CHANGED
+                               if (status_changed
+                                   or fs["scope"] != ts["scope"]
+                                   or any(d["classification"]
+                                          != cdiff.DIFF_UNCHANGED
+                                          for d in blocker_diffs))
+                               else cdiff.DIFF_UNCHANGED),
+            "status_flip_reasons": reasons,
+            "from": {"status": fs["status"], "scope": fs["scope"],
+                     "blockers": fs["blockers"], "batches": fs["batches"]},
+            "to": {"status": ts["status"], "scope": ts["scope"],
+                   "blockers": ts["blockers"], "batches": ts["batches"]},
+            "blockers": blocker_diffs}
 
 
 def _submission_dict(sub: dict) -> dict:
